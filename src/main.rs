@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use disk_inventory::cli::{self, OutputFormat};
 
 #[derive(Parser)]
 #[command(name = "disk-inventory", version, about = "Fast disk usage analysis")]
@@ -10,22 +11,69 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Show disk usage overview
-    Usage,
+    Usage {
+        /// Root path to analyze
+        path: Option<String>,
+        /// Depth of directory tree to display
+        #[arg(short, long, default_value = "1")]
+        depth: u32,
+        /// Output format
+        #[arg(short = 'f', long, value_enum, default_value = "table")]
+        format: OutputFormat,
+    },
     /// Show largest files and directories
-    Top,
+    Top {
+        /// Root path to analyze
+        path: Option<String>,
+        /// Show only files
+        #[arg(long)]
+        files: bool,
+        /// Show only directories
+        #[arg(long)]
+        dirs: bool,
+        /// Filter by file extensions (comma-separated)
+        #[arg(short, long)]
+        ext: Option<String>,
+        /// Only show items older than N days
+        #[arg(long)]
+        older: Option<u32>,
+        /// Maximum number of results
+        #[arg(short, long, default_value = "20")]
+        limit: u32,
+        /// Output format
+        #[arg(short = 'f', long, value_enum, default_value = "table")]
+        format: OutputFormat,
+    },
     /// Find reclaimable disk space
-    Waste,
+    Waste {},
     /// Search files by name pattern
     Search {
         /// Glob pattern to search for
         pattern: String,
+        /// Root path to search within
+        path: Option<String>,
+        /// Maximum number of results
+        #[arg(short, long, default_value = "50")]
+        limit: u32,
+        /// Output format
+        #[arg(short = 'f', long, value_enum, default_value = "table")]
+        format: OutputFormat,
     },
     /// Show disk usage by file type
-    Types,
+    Types {
+        /// Root path to analyze
+        path: Option<String>,
+        /// Maximum number of types to show
+        #[arg(short, long, default_value = "25")]
+        limit: u32,
+        /// Output format
+        #[arg(short = 'f', long, value_enum, default_value = "table")]
+        format: OutputFormat,
+    },
     /// Show disk usage trends over time
-    Trends,
+    Trends {},
     /// Find duplicate files
-    Duplicates,
+    Duplicates {},
     /// Manage the background daemon
     Daemon {
         #[command(subcommand)]
@@ -51,18 +99,51 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Usage => todo!("usage"),
-        Commands::Top => todo!("top"),
-        Commands::Waste => todo!("waste"),
-        Commands::Search { pattern: _ } => todo!("search"),
-        Commands::Types => todo!("types"),
-        Commands::Trends => todo!("trends"),
-        Commands::Duplicates => todo!("duplicates"),
+        Commands::Usage {
+            path,
+            depth,
+            format,
+        } => cli::run_usage(path, depth, &format),
+        Commands::Top {
+            path,
+            files,
+            dirs,
+            ext,
+            older,
+            limit,
+            format,
+        } => cli::run_top(path, files, dirs, ext, older, limit, &format),
+        Commands::Waste {} => todo!("waste"),
+        Commands::Search {
+            pattern,
+            path,
+            limit,
+            format,
+        } => cli::run_search(pattern, path, limit, &format),
+        Commands::Types {
+            path,
+            limit,
+            format,
+        } => cli::run_types(path, limit, &format),
+        Commands::Trends {} => todo!("trends"),
+        Commands::Duplicates {} => todo!("duplicates"),
         Commands::Daemon { action } => match action {
-            DaemonAction::Run => todo!("daemon run"),
+            DaemonAction::Run => {
+                tracing_subscriber::fmt()
+                    .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+                    .with_writer(std::io::stderr)
+                    .init();
+                let config = disk_inventory::config::Config::load()?;
+                disk_inventory::daemon::run_once(&config)?;
+                Ok(())
+            }
             DaemonAction::Install => todo!("daemon install"),
             DaemonAction::Uninstall => todo!("daemon uninstall"),
-            DaemonAction::Status => todo!("daemon status"),
+            DaemonAction::Status => {
+                let config = disk_inventory::config::Config::load()?;
+                disk_inventory::daemon::show_status(&config)?;
+                Ok(())
+            }
         },
         Commands::Mcp => todo!("mcp"),
     }

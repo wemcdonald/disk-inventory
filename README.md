@@ -23,19 +23,23 @@ disk-inventory top --files
 disk-inventory waste
 
 # Use with Claude Code (MCP)
-# Add to your .mcp.json — see MCP Setup below
+claude mcp add disk-inventory /path/to/disk-inventory -- mcp
 ```
 
 ## What It Does
 
-**Crawls** your filesystem with parallel directory walking (jwalk), collecting file metadata into a SQLite database with WAL mode for concurrent access.
+**Crawls** your filesystem fast. Parallel directory walking, platform-specific optimizations (FSEvents on macOS, inotify on Linux), and mtime-based incremental rescans that skip unchanged subtrees.
 
-**Indexes** everything: sizes (actual disk allocation, not logical), timestamps, extensions, directory hierarchy. Pre-computes recursive directory sizes so any query is instant.
+**Indexes** everything into SQLite: actual on-disk sizes (not logical — handles APFS clones and sparse files correctly), timestamps, extensions, directory hierarchy. Pre-computes recursive directory sizes so any query is instant.
 
 **Answers questions** through three interfaces:
 - **CLI** with human-readable tables, JSON, or CSV output
 - **MCP server** so Claude or other AI assistants can analyze your disk
 - **JSON** for scripting and piping
+
+**Detects waste** across 17 categories (node_modules, build artifacts, caches, Docker, Xcode, etc.) with safety ratings and cleanup commands.
+
+**Tracks history** so you can see what's growing over time and what changed since last week.
 
 ## CLI Commands
 
@@ -63,11 +67,48 @@ disk-inventory mcp                       # Start MCP server (stdio)
 
 All query commands support `--format json`, `--format csv`, or `--format table` (default).
 
+## Configuration
+
+`~/.disk-inventory/config.toml` (all fields optional, shown with defaults):
+
+```toml
+[daemon]
+scan_interval_secs = 21600        # 6 hours between rescans
+snapshot_interval_secs = 86400    # 1 day between history snapshots
+watch_paths = ["~"]               # Paths to index
+
+[scanner]
+exclude_patterns = [
+    ".Spotlight-V100", ".fseventsd", ".DocumentRevisions-V100",
+    ".Trashes", ".vol", ".DS_Store", "Thumbs.db",
+    ".disk-inventory", ".TimeMachine",
+]
+max_depth = 128
+follow_symlinks = false
+cross_filesystems = false
+
+[database]
+path = "~/.disk-inventory/index.db"
+history_retention_days = 90
+
+[waste]
+disabled_categories = []          # e.g., ["old_downloads"] to suppress
+```
+
+### Custom Waste Rules
+
+```toml
+[[waste_rules]]
+name = "Unity Library"
+pattern = "**/Library/Bee"
+category = "build_artifacts"
+safety = "safe"
+cleanup = "Unity rebuilds on next open"
+```
+
 ## MCP Setup
 
 ### Claude Code
-
-From the CLI:
 
 ```bash
 claude mcp add disk-inventory /path/to/disk-inventory -- mcp
@@ -110,15 +151,13 @@ Add to your `opencode.json`:
 
 ### Other MCP Clients
 
-Any client supporting MCP stdio transport can use disk-inventory. The server binary is:
+Any client supporting MCP stdio transport works. The server reads from stdin, writes JSON-RPC to stdout, logs to stderr.
 
 ```
-command: /path/to/disk-inventory
-args:    mcp
+command:   /path/to/disk-inventory
+args:      mcp
 transport: stdio
 ```
-
-The server reads from stdin, writes JSON-RPC to stdout, logs to stderr.
 
 ### MCP Tools
 
@@ -150,17 +189,6 @@ Built-in detection for 17 categories of reclaimable space, each with a safety ra
 | `trash` | Safe | `~/.Trash` contents |
 | `system_caches` | Review | `~/Library/Caches` |
 
-Custom rules can be added in `~/.disk-inventory/config.toml`:
-
-```toml
-[[waste_rules]]
-name = "Unity Library"
-pattern = "**/Library/Bee"
-category = "build_artifacts"
-safety = "safe"
-cleanup = "Unity rebuilds on next open"
-```
-
 ## Architecture
 
 Two-process design:
@@ -171,46 +199,40 @@ disk-inventory usage          reads from ->  ~/.disk-inventory/index.db
 disk-inventory mcp            reads from ->  ~/.disk-inventory/index.db
 ```
 
-The **daemon** crawls the filesystem and maintains the index. It can run as a one-shot (`--once`), a long-lived process with periodic rescans, or an OS service.
+The **daemon** crawls the filesystem and maintains the index. It can run as a one-shot (`--once`), a long-lived process with periodic rescans, or an OS service (launchd on macOS, systemd on Linux).
 
 The **CLI** and **MCP server** are read-only query layers over the shared database. SQLite WAL mode allows concurrent reads while the daemon writes.
 
-### Key Design Decisions
+## Under the Hood
 
-- **Actual disk size** (`blocks * 512`) instead of logical file size — correctly handles APFS clones, sparse files, and compression
-- **Pre-computed `dir_sizes` table** — O(1) lookup for any directory's recursive size
-- **FTS5** for instant filename search
-- **Incremental scanning** — mtime-based directory skipping for fast rescans
-- **Cross-filesystem guard** — won't wander into network mounts or external volumes (configurable)
-- **Debounced filesystem watcher** — FSEvents on macOS, inotify on Linux via the `notify` crate
+### Speed
 
-## Configuration
+- Parallel directory walking with work-stealing (jwalk)
+- Platform-specific metadata collection (macOS/Linux optimized)
+- mtime-based incremental rescans — unchanged subtrees are skipped entirely
+- Debounced filesystem watcher (FSEvents on macOS, inotify on Linux)
+- Actual disk size (`blocks * 512`) instead of logical file size — correctly handles APFS clones, sparse files, and compression
+- Pre-computed `dir_sizes` table — O(1) lookup for any directory's recursive size
+- FTS5 for instant filename search
+- Cross-filesystem guard — won't wander into network mounts (configurable)
 
-`~/.disk-inventory/config.toml` (all fields optional, shown with defaults):
+### Duplicate Detection
 
-```toml
-[daemon]
-scan_interval_secs = 21600        # 6 hours between rescans
-snapshot_interval_secs = 86400    # 1 day between history snapshots
-watch_paths = ["~"]               # Paths to index
+Three-tier approach minimizing I/O:
 
-[scanner]
-exclude_patterns = [
-    ".Spotlight-V100", ".fseventsd", ".DocumentRevisions-V100",
-    ".Trashes", ".vol", ".DS_Store", "Thumbs.db",
-    ".disk-inventory", ".TimeMachine",
-]
-max_depth = 128
-follow_symlinks = false
-cross_filesystems = false
+1. **Size grouping** (free) — files with unique sizes can't be duplicates, eliminating ~95% of files
+2. **Partial hash** — first 4KB with xxhash64 for remaining candidates
+3. **Full hash** — complete file xxhash64 only for files that match on size and partial hash
 
-[database]
-path = "~/.disk-inventory/index.db"
-history_retention_days = 90
+### Crawl Pipeline
 
-[waste]
-disabled_categories = []          # e.g., ["old_downloads"] to suppress
-```
+1. **Walk** — parallel directory traversal
+2. **Insert** — batch write file metadata to SQLite (10K rows/transaction)
+3. **Mark deletions** — soft-delete entries not seen in this scan
+4. **Compute dir_sizes** — bottom-up aggregation (deepest directories first)
+5. **Extension stats** — materialized breakdown by file type
+6. **Size history** — record directory sizes for trend analysis
+7. **Compact history** — roll up old entries (daily → weekly → monthly)
 
 ## Building
 
@@ -229,30 +251,6 @@ cargo build --release
 | macOS (Intel) | Supported |
 | Linux (x86_64) | Supported |
 | Linux (aarch64) | Supported |
-
-## How It Works
-
-### Crawl Pipeline
-
-1. **Walk** — parallel directory traversal with jwalk
-2. **Insert** — batch write file metadata to SQLite (10K rows/transaction)
-3. **Mark deletions** — soft-delete entries not seen in this scan
-4. **Compute dir_sizes** — bottom-up aggregation (deepest directories first)
-5. **Extension stats** — materialized breakdown by file type
-6. **Size history** — record directory sizes for trend analysis
-7. **Compact history** — roll up old entries (daily -> weekly -> monthly)
-
-### Incremental Scanning
-
-After the initial full crawl, rescans use mtime-based directory skipping: only directories whose modification time changed since the last scan are re-examined. Unchanged subtrees are skipped entirely.
-
-### Duplicate Detection
-
-Three-tier approach minimizing I/O:
-
-1. **Size grouping** (free) — files with unique sizes can't be duplicates, eliminating ~95% of files
-2. **Partial hash** — first 4KB with xxhash64 for remaining candidates
-3. **Full hash** — complete file xxhash64 only for files that match on size and partial hash
 
 ## License
 

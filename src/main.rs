@@ -45,7 +45,19 @@ enum Commands {
         format: OutputFormat,
     },
     /// Find reclaimable disk space
-    Waste {},
+    Waste {
+        path: Option<String>,
+        /// Category to scan (e.g., node_modules, build_artifacts)
+        #[arg(short, long)]
+        category: Option<String>,
+        /// Minimum total size per category in bytes
+        #[arg(long)]
+        min_size: Option<u64>,
+        #[arg(short, long, default_value = "20")]
+        limit: u32,
+        #[arg(short = 'f', long, value_enum, default_value = "table")]
+        format: OutputFormat,
+    },
     /// Search files by name pattern
     Search {
         /// Glob pattern to search for
@@ -71,9 +83,27 @@ enum Commands {
         format: OutputFormat,
     },
     /// Show disk usage trends over time
-    Trends {},
+    Trends {
+        path: Option<String>,
+        /// Time period: day, week, month, quarter, year
+        #[arg(short, long, default_value = "week")]
+        period: String,
+        #[arg(short, long, default_value = "20")]
+        limit: u32,
+        #[arg(short = 'f', long, value_enum, default_value = "table")]
+        format: OutputFormat,
+    },
     /// Find duplicate files
-    Duplicates {},
+    Duplicates {
+        path: Option<String>,
+        /// Minimum file size in bytes to check
+        #[arg(long, default_value = "1048576")]
+        min_size: u64,
+        #[arg(short, long, default_value = "20")]
+        limit: u32,
+        #[arg(short = 'f', long, value_enum, default_value = "table")]
+        format: OutputFormat,
+    },
     /// Manage the background daemon
     Daemon {
         #[command(subcommand)]
@@ -113,7 +143,8 @@ fn main() -> anyhow::Result<()> {
             limit,
             format,
         } => cli::run_top(path, files, dirs, ext, older, limit, &format),
-        Commands::Waste {} => todo!("waste"),
+        Commands::Waste { path, category, min_size, limit: _, format } =>
+            cli::run_waste(path, category, min_size, &format),
         Commands::Search {
             pattern,
             path,
@@ -125,8 +156,10 @@ fn main() -> anyhow::Result<()> {
             limit,
             format,
         } => cli::run_types(path, limit, &format),
-        Commands::Trends {} => todo!("trends"),
-        Commands::Duplicates {} => todo!("duplicates"),
+        Commands::Trends { path, period, limit, format } =>
+            cli::run_trends(path, &period, limit, &format),
+        Commands::Duplicates { path, min_size, limit, format } =>
+            cli::run_duplicates(path, min_size, limit, &format),
         Commands::Daemon { action } => match action {
             DaemonAction::Run => {
                 tracing_subscriber::fmt()

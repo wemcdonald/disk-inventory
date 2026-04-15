@@ -145,6 +145,17 @@ fn main() -> anyhow::Result<()> {
                 Ok(())
             }
         },
-        Commands::Mcp => todo!("mcp"),
+        Commands::Mcp => {
+            // Initialize tracing to stderr (stdout is for MCP protocol)
+            tracing_subscriber::fmt()
+                .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+                .with_writer(std::io::stderr)
+                .init();
+            let config = disk_inventory::config::Config::load()?;
+            let db = disk_inventory::db::Database::open(config.db_path())?;
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(disk_inventory::mcp::run_mcp_server(db))?;
+            Ok(())
+        }
     }
 }

@@ -3,6 +3,7 @@ pub mod config;
 pub mod crawler;
 pub mod daemon;
 pub mod db;
+pub mod mcp;
 pub mod models;
 pub mod query;
 pub mod waste;

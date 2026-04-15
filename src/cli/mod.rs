@@ -99,15 +99,16 @@ pub fn run_top(
     format: &OutputFormat,
 ) -> Result<()> {
     let db = open_db()?;
-    let item_type = if files_only {
+    let ext_vec: Option<Vec<String>> = extensions
+        .map(|e| e.split(',').map(|s| s.trim().to_string()).collect());
+    // If extension filter is set, implicitly filter to files only
+    let item_type = if files_only || ext_vec.is_some() {
         "files"
     } else if dirs_only {
         "directories"
     } else {
         "both"
     };
-    let ext_vec: Option<Vec<String>> = extensions
-        .map(|e| e.split(',').map(|s| s.trim().to_string()).collect());
     let result =
         query::query_large_items(&db, path.as_deref(), item_type, 0, limit, ext_vec.as_deref(), older)?;
     match format {

@@ -209,6 +209,17 @@ impl Database {
         Ok(())
     }
 
+    /// Mark any scans stuck in 'running' state as 'failed'.
+    /// Called on startup to clean up after crashes or Ctrl-C.
+    pub fn cleanup_stale_scans(&self) -> Result<u64> {
+        let conn = self.conn();
+        let count = conn.execute(
+            "UPDATE scans SET status = 'failed' WHERE status = 'running'",
+            [],
+        )?;
+        Ok(count as u64)
+    }
+
     /// Find any currently running scan.
     pub fn active_scan(&self) -> Result<Option<(ScanInfo, Option<ScanProgress>)>> {
         let conn = self.conn();
@@ -492,6 +503,21 @@ impl Database {
 
     /// Search files by name using FTS5.
     pub fn search_files_fts(&self, query: &str, limit: u32) -> Result<Vec<FileEntry>> {
+        // Sanitize: strip glob chars and FTS5 special syntax, quote tokens
+        let sanitized: String = query
+            .chars()
+            .filter(|c| !matches!(c, '*' | '?' | '{' | '}' | '[' | ']'))
+            .collect();
+        let sanitized = sanitized.trim();
+        if sanitized.is_empty() {
+            return Ok(Vec::new());
+        }
+        let fts_query: String = sanitized
+            .split_whitespace()
+            .map(|token| format!("\"{}\"", token.replace('"', "")))
+            .collect::<Vec<_>>()
+            .join(" ");
+
         let conn = self.conn();
         let sql = format!(
             "SELECT {} FROM files
@@ -503,7 +529,7 @@ impl Database {
             FILE_COLUMNS
         );
         let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(params![query, limit], file_entry_from_row)?;
+        let rows = stmt.query_map(params![fts_query, limit], file_entry_from_row)?;
 
         let mut result = Vec::new();
         for r in rows {

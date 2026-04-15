@@ -11,6 +11,11 @@ use std::path::Path;
 
 /// Run a full crawl: walk filesystem, insert entries, compute aggregates.
 pub fn run_crawl(db: &Database, root: &Path, config: &Config) -> Result<ScanInfo> {
+    // Clean up any scans left in 'running' state from prior crashes
+    let stale = db.cleanup_stale_scans()?;
+    if stale > 0 {
+        tracing::info!("Cleaned up {} stale scan(s) from prior run", stale);
+    }
     let root_path = root.to_string_lossy().to_string();
     let scan_id = db.create_scan(&root_path)?;
     let start_time = std::time::Instant::now();

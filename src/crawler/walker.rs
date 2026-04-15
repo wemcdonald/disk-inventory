@@ -1,10 +1,14 @@
 use crate::config::Config;
+use crate::crawler::platform;
 use crate::models::*;
 use anyhow::Result;
 use std::path::Path;
 
 /// Walk a directory tree and collect FileEntry records.
-/// Uses jwalk for parallel directory traversal.
+///
+/// Uses jwalk for parallel directory traversal and delegates per-entry
+/// metadata collection to [`platform::get_metadata`], which selects the
+/// best syscall strategy for the current OS.
 pub fn walk_directory(root: &Path, scan_id: i64, config: &Config) -> Result<Vec<FileEntry>> {
     let mut entries = Vec::new();
 
@@ -33,8 +37,8 @@ pub fn walk_directory(root: &Path, scan_id: i64, config: &Config) -> Result<Vec<
         let path = dir_entry.path();
         let path_str = path.to_string_lossy().to_string();
 
-        // Get metadata
-        let metadata = match std::fs::symlink_metadata(&path) {
+        // Collect metadata via platform-optimized implementation
+        let meta = match platform::get_metadata(&path) {
             Ok(m) => m,
             Err(e) => {
                 tracing::warn!("metadata error for {}: {}", path_str, e);
@@ -42,57 +46,17 @@ pub fn walk_directory(root: &Path, scan_id: i64, config: &Config) -> Result<Vec<
             }
         };
 
-        let file_type = if metadata.is_symlink() {
-            FileType::Symlink
-        } else if metadata.is_dir() {
-            FileType::Directory
-        } else if metadata.is_file() {
-            FileType::File
+        let extension = if meta.file_type == FileType::File {
+            extract_extension(&name)
         } else {
-            FileType::Other
+            None
         };
-
-        let size_bytes = if file_type == FileType::File {
-            metadata.len()
-        } else {
-            0
-        };
-
-        let mtime = metadata
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-
-        // Unix-specific metadata
-        #[cfg(unix)]
-        let (inode, device_id, hardlink_count, blocks, uid, gid, mode, atime, ctime) = {
-            use std::os::unix::fs::MetadataExt;
-            (
-                metadata.ino(),
-                metadata.dev(),
-                metadata.nlink(),
-                metadata.blocks(),
-                metadata.uid(),
-                metadata.gid(),
-                metadata.mode(),
-                metadata.atime(),
-                metadata.ctime(),
-            )
-        };
-
-        #[cfg(not(unix))]
-        let (inode, device_id, hardlink_count, blocks, uid, gid, mode, atime, ctime) =
-            (0u64, 0u64, 1u64, 0u64, 0u32, 0u32, 0u32, 0i64, 0i64);
-
-        let extension = extract_extension(&name);
         let parent = parent_path(&path_str);
         let depth = path_depth(&path_str);
         let components = path_component_count(&path_str);
 
         // Symlink target
-        let symlink_target = if file_type == FileType::Symlink {
+        let symlink_target = if meta.file_type == FileType::Symlink {
             std::fs::read_link(&path)
                 .ok()
                 .map(|t| t.to_string_lossy().to_string())
@@ -106,20 +70,20 @@ pub fn walk_directory(root: &Path, scan_id: i64, config: &Config) -> Result<Vec<
             parent_path: parent,
             name,
             extension,
-            file_type,
-            inode,
-            device_id,
-            hardlink_count,
+            file_type: meta.file_type,
+            inode: meta.inode,
+            device_id: meta.device_id,
+            hardlink_count: meta.hardlink_count,
             symlink_target,
-            size_bytes,
-            blocks,
-            mtime,
-            ctime,
-            atime,
-            birth_time: None,
-            uid,
-            gid,
-            mode,
+            size_bytes: meta.size_bytes,
+            blocks: meta.blocks,
+            mtime: meta.mtime,
+            ctime: meta.ctime,
+            atime: meta.atime,
+            birth_time: meta.birth_time,
+            uid: meta.uid,
+            gid: meta.gid,
+            mode: meta.mode,
             scan_id,
             first_seen_scan: scan_id,
             is_deleted: false,

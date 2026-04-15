@@ -12,6 +12,7 @@ use super::Database;
 // ---------------------------------------------------------------------------
 
 /// Statistics collected during a scan, used to finalize a scan record.
+#[derive(Default)]
 pub struct ScanStats {
     pub total_files: u64,
     pub total_dirs: u64,
@@ -33,6 +34,19 @@ pub struct SearchCriteria {
     pub accessed_after: Option<i64>,
     pub accessed_before: Option<i64>,
     pub limit: u32,
+}
+
+/// A single entry in the trend analysis results.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TrendEntry {
+    pub path: String,
+    pub current_size: u64,
+    pub current_size_human: String,
+    pub previous_size: u64,
+    pub growth_bytes: i64,
+    pub growth_human: String,
+    pub growth_percent: f64,
+    pub file_count_change: i64,
 }
 
 // ---------------------------------------------------------------------------
@@ -486,6 +500,305 @@ impl Database {
         }
         Ok(result)
     }
+
+    // -----------------------------------------------------------------------
+    // Size history & trends
+    // -----------------------------------------------------------------------
+
+    /// Record size history entries for directories above a size threshold.
+    /// Compares current dir_sizes against the previous scan's history to compute deltas.
+    pub fn record_size_history(&self, scan_id: i64, min_size: u64) -> Result<()> {
+        let conn = self.conn();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        // Get the previous scan ID from size_history
+        let prev_scan_id: Option<i64> = conn
+            .query_row(
+                "SELECT MAX(scan_id) FROM size_history WHERE scan_id < ?1",
+                params![scan_id],
+                |row| row.get(0),
+            )
+            .ok()
+            .flatten();
+
+        // For each dir_size above threshold, insert a history entry with delta
+        conn.execute(
+            "INSERT INTO size_history (path, scan_id, recorded_at, total_size, file_count, delta_size, delta_files)
+             SELECT ds.path, ?1, ?2, ds.total_size, ds.file_count,
+                    ds.total_size - COALESCE(prev.total_size, 0),
+                    CAST(ds.file_count AS INTEGER) - CAST(COALESCE(prev.file_count, 0) AS INTEGER)
+             FROM dir_sizes ds
+             LEFT JOIN size_history prev ON prev.path = ds.path AND prev.scan_id = ?3
+             WHERE ds.total_size >= ?4",
+            params![scan_id, now, prev_scan_id.unwrap_or(0), min_size as i64],
+        )?;
+
+        Ok(())
+    }
+
+    /// Query trend data: directories with the biggest size changes.
+    pub fn query_trends(
+        &self,
+        path: Option<&str>,
+        since: i64, // unix timestamp
+        limit: u32,
+        sort_by: &str, // "absolute_growth", "growth_rate", "current_size"
+    ) -> Result<Vec<TrendEntry>> {
+        let conn = self.conn();
+
+        // Build the query: for each path that has history entries since the cutoff,
+        // get the earliest and latest snapshot in the window.
+        let path_filter = match path {
+            Some(p) => {
+                let prefix = if p.ends_with('/') {
+                    p.to_string()
+                } else {
+                    format!("{}/", p)
+                };
+                format!(
+                    "AND (h.path = '{}' OR h.path LIKE '{}%')",
+                    p.replace('\'', "''"),
+                    prefix.replace('\'', "''")
+                )
+            }
+            None => String::new(),
+        };
+
+        let order_clause = match sort_by {
+            "growth_rate" => "ORDER BY CASE WHEN earliest_size = 0 THEN 0 ELSE ABS(CAST(latest_size - earliest_size AS REAL) / earliest_size) END DESC",
+            "current_size" => "ORDER BY latest_size DESC",
+            _ => "ORDER BY ABS(latest_size - earliest_size) DESC", // "absolute_growth"
+        };
+
+        let sql = format!(
+            "WITH ranked AS (
+                SELECT
+                    h.path,
+                    h.total_size,
+                    h.file_count,
+                    h.recorded_at,
+                    ROW_NUMBER() OVER (PARTITION BY h.path ORDER BY h.recorded_at ASC) AS rn_asc,
+                    ROW_NUMBER() OVER (PARTITION BY h.path ORDER BY h.recorded_at DESC) AS rn_desc
+                FROM size_history h
+                WHERE h.recorded_at >= ?1
+                {path_filter}
+            ),
+            summary AS (
+                SELECT
+                    earliest.path,
+                    latest.total_size AS latest_size,
+                    earliest.total_size AS earliest_size,
+                    CAST(latest.file_count AS INTEGER) - CAST(earliest.file_count AS INTEGER) AS file_count_change
+                FROM ranked earliest
+                JOIN ranked latest ON earliest.path = latest.path AND latest.rn_desc = 1
+                WHERE earliest.rn_asc = 1
+            )
+            SELECT path, latest_size, earliest_size, file_count_change
+            FROM summary
+            {order_clause}
+            LIMIT ?2"
+        );
+
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![since, limit], |row| {
+            let path: String = row.get(0)?;
+            let current_size: u64 = row.get(1)?;
+            let previous_size: u64 = row.get(2)?;
+            let file_count_change: i64 = row.get(3)?;
+            let growth_bytes = current_size as i64 - previous_size as i64;
+            let growth_percent = if previous_size == 0 {
+                if current_size > 0 {
+                    100.0
+                } else {
+                    0.0
+                }
+            } else {
+                growth_bytes as f64 / previous_size as f64 * 100.0
+            };
+
+            let growth_human = if growth_bytes >= 0 {
+                format!("+{}", crate::models::format_size(growth_bytes as u64))
+            } else {
+                format!("-{}", crate::models::format_size((-growth_bytes) as u64))
+            };
+
+            Ok(TrendEntry {
+                path,
+                current_size,
+                current_size_human: crate::models::format_size(current_size),
+                previous_size,
+                growth_bytes,
+                growth_human,
+                growth_percent,
+                file_count_change,
+            })
+        })?;
+
+        let mut result = Vec::new();
+        for r in rows {
+            result.push(r?);
+        }
+        Ok(result)
+    }
+
+    // -----------------------------------------------------------------------
+    // Duplicate detection
+    // -----------------------------------------------------------------------
+
+    /// Find files that share the same size (potential duplicates).
+    /// Returns a list of (size, files) tuples for sizes with more than one file.
+    pub fn files_with_duplicate_sizes(
+        &self,
+        path: Option<&str>,
+        min_size: u64,
+        extensions: Option<&[String]>,
+    ) -> Result<Vec<(u64, Vec<FileEntry>)>> {
+        let conn = self.conn();
+
+        // Build optional conditions for the size-grouping query
+        let mut conditions = vec![
+            "file_type = 0".to_string(),
+            "is_deleted = 0".to_string(),
+        ];
+        let mut bound_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        let mut param_idx = 1u32;
+
+        conditions.push(format!("size_bytes >= ?{}", param_idx));
+        bound_params.push(Box::new(min_size));
+        param_idx += 1;
+
+        if let Some(p) = path {
+            let prefix = if p.ends_with('/') {
+                p.to_string()
+            } else {
+                format!("{}/", p)
+            };
+            let upper = path_upper_bound(&prefix);
+            conditions.push(format!("path >= ?{}", param_idx));
+            bound_params.push(Box::new(prefix));
+            param_idx += 1;
+            conditions.push(format!("path < ?{}", param_idx));
+            bound_params.push(Box::new(upper));
+            param_idx += 1;
+        }
+
+        if let Some(exts) = extensions {
+            if !exts.is_empty() {
+                let placeholders: Vec<String> = exts
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _)| format!("?{}", param_idx + i as u32))
+                    .collect();
+                conditions.push(format!("extension IN ({})", placeholders.join(", ")));
+                for ext in exts {
+                    bound_params.push(Box::new(ext.clone()));
+                }
+                #[allow(unused_assignments)]
+                { param_idx += exts.len() as u32; }
+            }
+        }
+
+        let where_clause = conditions.join(" AND ");
+
+        // First query: find sizes with duplicates
+        let size_sql = format!(
+            "SELECT size_bytes FROM files \
+             WHERE {} \
+             GROUP BY size_bytes HAVING COUNT(*) > 1 \
+             ORDER BY size_bytes DESC",
+            where_clause
+        );
+
+        let mut size_stmt = conn.prepare(&size_sql)?;
+        let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+            bound_params.iter().map(|b| b.as_ref()).collect();
+        let size_rows = size_stmt.query_map(params_refs.as_slice(), |row| {
+            row.get::<_, u64>(0)
+        })?;
+
+        let mut dup_sizes: Vec<u64> = Vec::new();
+        for r in size_rows {
+            dup_sizes.push(r?);
+        }
+
+        // Second: for each duplicate size, fetch the matching files
+        let mut result: Vec<(u64, Vec<FileEntry>)> = Vec::new();
+
+        for size in dup_sizes {
+            let mut file_conditions = vec![
+                "file_type = 0".to_string(),
+                "is_deleted = 0".to_string(),
+            ];
+            let mut file_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+            let mut fp_idx = 1u32;
+
+            file_conditions.push(format!("size_bytes = ?{}", fp_idx));
+            file_params.push(Box::new(size));
+            fp_idx += 1;
+
+            if let Some(p) = path {
+                let prefix = if p.ends_with('/') {
+                    p.to_string()
+                } else {
+                    format!("{}/", p)
+                };
+                let upper = path_upper_bound(&prefix);
+                file_conditions.push(format!("path >= ?{}", fp_idx));
+                file_params.push(Box::new(prefix));
+                fp_idx += 1;
+                file_conditions.push(format!("path < ?{}", fp_idx));
+                file_params.push(Box::new(upper));
+                fp_idx += 1;
+            }
+
+            if let Some(exts) = extensions {
+                if !exts.is_empty() {
+                    let placeholders: Vec<String> = exts
+                        .iter()
+                        .enumerate()
+                        .map(|(i, _)| format!("?{}", fp_idx + i as u32))
+                        .collect();
+                    file_conditions.push(format!(
+                        "extension IN ({})",
+                        placeholders.join(", ")
+                    ));
+                    for ext in exts {
+                        file_params.push(Box::new(ext.clone()));
+                    }
+                }
+            }
+
+            let file_where = file_conditions.join(" AND ");
+            let file_sql = format!(
+                "SELECT {} FROM files WHERE {}",
+                FILE_COLUMNS, file_where
+            );
+
+            let mut file_stmt = conn.prepare(&file_sql)?;
+            let fp_refs: Vec<&dyn rusqlite::types::ToSql> =
+                file_params.iter().map(|b| b.as_ref()).collect();
+            let file_rows =
+                file_stmt.query_map(fp_refs.as_slice(), file_entry_from_row)?;
+
+            let mut entries: Vec<FileEntry> = Vec::new();
+            for r in file_rows {
+                entries.push(r?);
+            }
+
+            if entries.len() > 1 {
+                result.push((size, entries));
+            }
+        }
+
+        Ok(result)
+    }
+
+    // -----------------------------------------------------------------------
+    // Query functions
+    // -----------------------------------------------------------------------
 
     /// Find files matching various criteria.
     pub fn find_files(&self, criteria: &SearchCriteria) -> Result<Vec<FileEntry>> {
@@ -968,5 +1281,207 @@ mod tests {
         // Sorted by size desc: med.log first, then tiny.rs
         assert_eq!(files[0].name, "med.log");
         assert_eq!(files[1].name, "tiny.rs");
+    }
+
+    #[test]
+    fn test_record_size_history() {
+        let (db, scan_id) = test_db_with_data();
+
+        // Insert dir_sizes for scan 1
+        let sizes = vec![
+            DirSize {
+                path: "/test".to_string(),
+                total_size: 1_050_001_524,
+                file_count: 4,
+                dir_count: 1,
+                max_depth: 3,
+                largest_file: 1_000_000_000,
+                scan_id,
+            },
+            DirSize {
+                path: "/test/sub".to_string(),
+                total_size: 50_000_500,
+                file_count: 2,
+                dir_count: 0,
+                max_depth: 1,
+                largest_file: 50_000_000,
+                scan_id,
+            },
+        ];
+        db.insert_dir_sizes(&sizes).expect("insert_dir_sizes");
+
+        // Record history for scan 1 with a low threshold so both dirs are included
+        db.record_size_history(scan_id, 1_000_000)
+            .expect("record_size_history scan 1");
+
+        // Verify history entries for scan 1 (first scan, so delta = total_size since no prev)
+        {
+            let conn = db.conn();
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM size_history WHERE scan_id = ?1",
+                    params![scan_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 2, "should have 2 history entries for scan 1");
+        }
+
+        // Create scan 2 with different sizes
+        let scan2_id = db.create_scan("/test").expect("create_scan 2");
+
+        let sizes2 = vec![
+            DirSize {
+                path: "/test".to_string(),
+                total_size: 1_200_000_000, // grew
+                file_count: 5,
+                dir_count: 1,
+                max_depth: 3,
+                largest_file: 1_000_000_000,
+                scan_id: scan2_id,
+            },
+            DirSize {
+                path: "/test/sub".to_string(),
+                total_size: 60_000_000, // grew
+                file_count: 3,
+                dir_count: 0,
+                max_depth: 1,
+                largest_file: 50_000_000,
+                scan_id: scan2_id,
+            },
+        ];
+        db.insert_dir_sizes(&sizes2).expect("insert_dir_sizes scan 2");
+
+        // Record history for scan 2
+        db.record_size_history(scan2_id, 1_000_000)
+            .expect("record_size_history scan 2");
+
+        // Verify scan 2 history has correct deltas
+        {
+            let conn = db.conn();
+            let delta_size: i64 = conn
+                .query_row(
+                    "SELECT delta_size FROM size_history WHERE scan_id = ?1 AND path = '/test'",
+                    params![scan2_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                delta_size,
+                1_200_000_000 - 1_050_001_524,
+                "delta for /test should be growth amount"
+            );
+
+            let delta_files: i64 = conn
+                .query_row(
+                    "SELECT delta_files FROM size_history WHERE scan_id = ?1 AND path = '/test'",
+                    params![scan2_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(delta_files, 1, "file count grew by 1");
+        }
+    }
+
+    #[test]
+    fn test_query_trends() {
+        let (db, scan_id) = test_db_with_data();
+
+        // Insert dir_sizes for scan 1
+        let sizes = vec![
+            DirSize {
+                path: "/test".to_string(),
+                total_size: 1_000_000_000,
+                file_count: 4,
+                dir_count: 1,
+                max_depth: 3,
+                largest_file: 1_000_000_000,
+                scan_id,
+            },
+            DirSize {
+                path: "/test/sub".to_string(),
+                total_size: 50_000_000,
+                file_count: 2,
+                dir_count: 0,
+                max_depth: 1,
+                largest_file: 50_000_000,
+                scan_id,
+            },
+        ];
+        db.insert_dir_sizes(&sizes).expect("insert_dir_sizes");
+        db.record_size_history(scan_id, 1_000_000)
+            .expect("record_size_history scan 1");
+
+        // Create scan 2 with growth
+        let scan2_id = db.create_scan("/test").expect("create_scan 2");
+
+        let sizes2 = vec![
+            DirSize {
+                path: "/test".to_string(),
+                total_size: 1_500_000_000, // +500MB
+                file_count: 6,
+                dir_count: 1,
+                max_depth: 3,
+                largest_file: 1_000_000_000,
+                scan_id: scan2_id,
+            },
+            DirSize {
+                path: "/test/sub".to_string(),
+                total_size: 100_000_000, // +50MB (doubled)
+                file_count: 4,
+                dir_count: 0,
+                max_depth: 1,
+                largest_file: 50_000_000,
+                scan_id: scan2_id,
+            },
+        ];
+        db.insert_dir_sizes(&sizes2).expect("insert_dir_sizes scan 2");
+        db.record_size_history(scan2_id, 1_000_000)
+            .expect("record_size_history scan 2");
+
+        // Query trends sorted by absolute growth (since epoch, so all entries included)
+        let trends = db
+            .query_trends(None, 0, 10, "absolute_growth")
+            .expect("query_trends");
+
+        assert_eq!(trends.len(), 2, "should have 2 trend entries");
+
+        // /test grew by 500MB, /test/sub grew by 50MB -> /test first
+        assert_eq!(trends[0].path, "/test");
+        assert_eq!(trends[0].current_size, 1_500_000_000);
+        assert_eq!(trends[0].previous_size, 1_000_000_000);
+        assert_eq!(trends[0].growth_bytes, 500_000_000);
+        assert_eq!(trends[0].file_count_change, 2);
+
+        assert_eq!(trends[1].path, "/test/sub");
+        assert_eq!(trends[1].current_size, 100_000_000);
+        assert_eq!(trends[1].previous_size, 50_000_000);
+        assert_eq!(trends[1].growth_bytes, 50_000_000);
+
+        // Query by growth_rate: /test/sub doubled (100%) vs /test grew 50%
+        let trends_rate = db
+            .query_trends(None, 0, 10, "growth_rate")
+            .expect("query_trends growth_rate");
+
+        assert_eq!(
+            trends_rate[0].path, "/test/sub",
+            "/test/sub has higher growth rate"
+        );
+        assert!((trends_rate[0].growth_percent - 100.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn test_query_trends_empty() {
+        let db = Database::open_in_memory().expect("open_in_memory");
+
+        // No history data -- should return empty
+        let trends = db
+            .query_trends(None, 0, 10, "absolute_growth")
+            .expect("query_trends empty");
+
+        assert!(
+            trends.is_empty(),
+            "should return empty trends when no history data"
+        );
     }
 }

@@ -160,7 +160,7 @@ impl Database {
                     total_size, files_added, files_modified, files_deleted, status
              FROM scans
              WHERE status = 'completed'
-             ORDER BY completed_at DESC
+             ORDER BY id DESC
              LIMIT 1",
         )?;
 
@@ -464,7 +464,7 @@ impl Database {
         let conn = self.conn();
         conn.execute(
             "INSERT OR REPLACE INTO extension_stats (extension, scan_id, file_count, total_size, avg_size, largest_size)
-             SELECT extension, ?1, COUNT(*), SUM(size_bytes), AVG(size_bytes), MAX(size_bytes)
+             SELECT extension, ?1, COUNT(*), SUM(size_bytes), CAST(AVG(size_bytes) AS INTEGER), MAX(size_bytes)
              FROM files
              WHERE file_type = 0 AND is_deleted = 0 AND extension IS NOT NULL AND scan_id = ?1
              GROUP BY extension",

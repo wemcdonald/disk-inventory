@@ -115,30 +115,58 @@ impl DiskInventoryServer {
     #[tool(description = "Find reclaimable space: build artifacts, caches, logs, node_modules. Includes safety ratings and cleanup commands.")]
     async fn find_waste(
         &self,
-        Parameters(_params): Parameters<FindWasteParams>,
+        Parameters(params): Parameters<FindWasteParams>,
     ) -> Result<CallToolResult, McpError> {
+        let categories = params.categories.unwrap_or_else(|| vec!["all".to_string()]);
+        let min_size = params.min_size_bytes.unwrap_or(50 * 1024 * 1024); // 50MB default
+        let config = crate::config::Config::load()
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        let result = crate::waste::detect_waste(
+            &self.db,
+            params.path.as_deref(),
+            &categories,
+            min_size,
+            &config.waste.disabled_categories,
+        )
+        .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         Ok(CallToolResult::success(vec![Content::text(
-            "{\"error\": \"not yet implemented\"}".to_string(),
+            serde_json::to_string_pretty(&result).unwrap(),
         )]))
     }
 
     #[tool(description = "Find duplicate files by content hash.")]
     async fn find_duplicates(
         &self,
-        Parameters(_params): Parameters<FindDuplicatesParams>,
+        Parameters(params): Parameters<FindDuplicatesParams>,
     ) -> Result<CallToolResult, McpError> {
+        let result = crate::duplicates::find_duplicates(
+            &self.db,
+            params.path.as_deref(),
+            params.min_size_bytes.unwrap_or(1024 * 1024), // 1MB default
+            None, // extensions filter not in params yet
+            params.limit.unwrap_or(20),
+        )
+        .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         Ok(CallToolResult::success(vec![Content::text(
-            "{\"error\": \"not yet implemented\"}".to_string(),
+            serde_json::to_string_pretty(&result).unwrap(),
         )]))
     }
 
     #[tool(description = "Show disk usage trends over time.")]
     async fn disk_trends(
         &self,
-        Parameters(_params): Parameters<DiskTrendsParams>,
+        Parameters(params): Parameters<DiskTrendsParams>,
     ) -> Result<CallToolResult, McpError> {
+        let result = crate::query::query_trends(
+            &self.db,
+            params.path.as_deref(),
+            params.period.as_deref().unwrap_or("week"),
+            "absolute_growth",
+            params.limit.unwrap_or(20),
+        )
+        .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         Ok(CallToolResult::success(vec![Content::text(
-            "{\"error\": \"not yet implemented\"}".to_string(),
+            serde_json::to_string_pretty(&result).unwrap(),
         )]))
     }
 }

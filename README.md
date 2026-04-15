@@ -65,7 +65,19 @@ All query commands support `--format json`, `--format csv`, or `--format table` 
 
 ## MCP Setup
 
-Add to your Claude Code MCP config (`~/.claude/mcp.json` or project `.mcp.json`):
+### Claude Code
+
+From the CLI:
+
+```bash
+claude mcp add disk-inventory /path/to/disk-inventory -- mcp
+```
+
+Or inside Claude Code, run `/mcp` → "Add new MCP server" → stdio → command: `/path/to/disk-inventory` → args: `mcp`.
+
+### Cursor
+
+Add to your Cursor MCP config (Settings → MCP Servers → Add):
 
 ```json
 {
@@ -77,6 +89,36 @@ Add to your Claude Code MCP config (`~/.claude/mcp.json` or project `.mcp.json`)
   }
 }
 ```
+
+Or add directly to `~/.cursor/mcp.json`.
+
+### opencode
+
+Add to your `opencode.json`:
+
+```json
+{
+  "mcp": {
+    "disk-inventory": {
+      "type": "stdio",
+      "command": "/path/to/disk-inventory",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+### Other MCP Clients
+
+Any client supporting MCP stdio transport can use disk-inventory. The server binary is:
+
+```
+command: /path/to/disk-inventory
+args:    mcp
+transport: stdio
+```
+
+The server reads from stdin, writes JSON-RPC to stdout, logs to stderr.
 
 ### MCP Tools
 

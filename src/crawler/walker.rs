@@ -95,6 +95,210 @@ pub fn walk_directory(root: &Path, scan_id: i64, config: &Config) -> Result<Vec<
     Ok(entries)
 }
 
+/// Walk a directory tree incrementally — only descend into directories
+/// whose mtime is newer than `since_timestamp`.
+///
+/// Returns (entries, dirs_scanned, dirs_skipped).
+pub fn walk_directory_incremental(
+    root: &Path,
+    scan_id: i64,
+    config: &Config,
+    since_timestamp: i64,
+) -> Result<(Vec<FileEntry>, u64, u64)> {
+    let mut entries = Vec::new();
+    let mut dirs_scanned: u64 = 0;
+    let mut dirs_skipped: u64 = 0;
+
+    walk_recursive(
+        root,
+        scan_id,
+        config,
+        since_timestamp,
+        &mut entries,
+        &mut dirs_scanned,
+        &mut dirs_skipped,
+        0,
+    )?;
+
+    Ok((entries, dirs_scanned, dirs_skipped))
+}
+
+fn build_file_entry(
+    path: &Path,
+    scan_id: i64,
+) -> Option<FileEntry> {
+    let path_str = path.to_string_lossy().to_string();
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| path_str.clone());
+
+    let meta = match platform::get_metadata(path) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!("metadata error for {}: {}", path_str, e);
+            return None;
+        }
+    };
+
+    let extension = if meta.file_type == FileType::File {
+        extract_extension(&name)
+    } else {
+        None
+    };
+    let parent = parent_path(&path_str);
+    let depth = path_depth(&path_str);
+    let components = path_component_count(&path_str);
+
+    let symlink_target = if meta.file_type == FileType::Symlink {
+        std::fs::read_link(path)
+            .ok()
+            .map(|t| t.to_string_lossy().to_string())
+    } else {
+        None
+    };
+
+    Some(FileEntry {
+        id: None,
+        path: path_str,
+        parent_path: parent,
+        name,
+        extension,
+        file_type: meta.file_type,
+        inode: meta.inode,
+        device_id: meta.device_id,
+        hardlink_count: meta.hardlink_count,
+        symlink_target,
+        size_bytes: meta.size_bytes,
+        blocks: meta.blocks,
+        mtime: meta.mtime,
+        ctime: meta.ctime,
+        atime: meta.atime,
+        birth_time: meta.birth_time,
+        uid: meta.uid,
+        gid: meta.gid,
+        mode: meta.mode,
+        scan_id,
+        first_seen_scan: scan_id,
+        is_deleted: false,
+        depth,
+        path_components: components,
+    })
+}
+
+fn walk_recursive(
+    dir: &Path,
+    scan_id: i64,
+    config: &Config,
+    since_timestamp: i64,
+    entries: &mut Vec<FileEntry>,
+    dirs_scanned: &mut u64,
+    dirs_skipped: &mut u64,
+    depth: u32,
+) -> Result<()> {
+    if depth > config.scanner.max_depth {
+        return Ok(());
+    }
+
+    // Check directory mtime via platform metadata
+    let dir_meta = match platform::get_metadata(dir) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!("Cannot stat directory {}: {}", dir.display(), e);
+            return Ok(());
+        }
+    };
+
+    let dir_str = dir.to_string_lossy().to_string();
+    let dir_name = dir
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| dir_str.clone());
+
+    // Check exclusion
+    if config.is_excluded(&dir_name) {
+        return Ok(());
+    }
+
+    // Always record the directory entry itself
+    if let Some(dir_entry) = build_file_entry(dir, scan_id) {
+        entries.push(dir_entry);
+    }
+
+    let dir_mtime = dir_meta.mtime;
+
+    if dir_mtime <= since_timestamp {
+        // Directory hasn't changed — skip scanning its contents
+        // But still recurse into subdirectories to check THEIR mtimes
+        *dirs_skipped += 1;
+
+        if let Ok(read_dir) = std::fs::read_dir(dir) {
+            for entry in read_dir.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    if !config.is_excluded(&name) {
+                        walk_recursive(
+                            &path,
+                            scan_id,
+                            config,
+                            since_timestamp,
+                            entries,
+                            dirs_scanned,
+                            dirs_skipped,
+                            depth + 1,
+                        )?;
+                    }
+                }
+                // Skip files in unchanged directories — they're already in the DB
+            }
+        }
+    } else {
+        // Directory has changed — scan all contents
+        *dirs_scanned += 1;
+
+        if let Ok(read_dir) = std::fs::read_dir(dir) {
+            for entry_result in read_dir {
+                let entry = match entry_result {
+                    Ok(e) => e,
+                    Err(e) => {
+                        tracing::warn!("readdir error in {}: {}", dir.display(), e);
+                        continue;
+                    }
+                };
+
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().to_string();
+
+                if config.is_excluded(&name) {
+                    continue;
+                }
+
+                if path.is_dir() {
+                    // Subdirectories record themselves at the top of walk_recursive
+                    walk_recursive(
+                        &path,
+                        scan_id,
+                        config,
+                        since_timestamp,
+                        entries,
+                        dirs_scanned,
+                        dirs_skipped,
+                        depth + 1,
+                    )?;
+                } else {
+                    // Build FileEntry for non-directory entries
+                    if let Some(file_entry) = build_file_entry(&path, scan_id) {
+                        entries.push(file_entry);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,5 +377,75 @@ mod tests {
         let config = Config::default();
         let result = walk_directory(dir.path(), 1, &config);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_walk_directory_incremental_all_changed() {
+        // With since_timestamp=0, everything should be scanned (all dirs are newer)
+        let dir = create_test_tree();
+        let config = Config::default();
+
+        let (entries, dirs_scanned, _dirs_skipped) =
+            walk_directory_incremental(dir.path(), 1, &config, 0).unwrap();
+
+        // Should find the same entries as a full walk
+        assert_eq!(
+            entries.len(),
+            7,
+            "expected 7 entries (same as full walk), got {}: {:?}",
+            entries.len(),
+            entries.iter().map(|e| &e.name).collect::<Vec<_>>()
+        );
+        assert!(dirs_scanned >= 1, "at least root should be scanned");
+
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"big.bin"));
+        assert!(names.contains(&"small.txt"));
+        assert!(names.contains(&"sub"));
+        assert!(names.contains(&"medium.log"));
+    }
+
+    #[test]
+    fn test_walk_directory_incremental_skips_old_dirs() {
+        let dir = create_test_tree();
+        let config = Config::default();
+
+        // Use a timestamp far in the future so all directories are "old"
+        let future_ts = chrono::Utc::now().timestamp() + 10_000;
+        let (entries, dirs_scanned, dirs_skipped) =
+            walk_directory_incremental(dir.path(), 1, &config, future_ts).unwrap();
+
+        // Should only find directory entries (since we always record directory entries)
+        // but no file entries (since all dirs are "unchanged")
+        let file_entries: Vec<_> = entries
+            .iter()
+            .filter(|e| e.file_type == FileType::File)
+            .collect();
+        assert_eq!(
+            file_entries.len(),
+            0,
+            "no files should be found when all dirs are skipped"
+        );
+
+        // All directories should be skipped
+        assert_eq!(dirs_scanned, 0, "no dirs should be fully scanned");
+        assert!(dirs_skipped >= 1, "at least some dirs should be skipped");
+    }
+
+    #[test]
+    fn test_walk_incremental_excludes_patterns() {
+        let dir = create_test_tree();
+        std::fs::create_dir(dir.path().join(".DS_Store_dir")).unwrap();
+        std::fs::write(dir.path().join(".DS_Store"), "excluded").unwrap();
+
+        let config = Config::default();
+        let (entries, _, _) =
+            walk_directory_incremental(dir.path(), 1, &config, 0).unwrap();
+
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(
+            !names.contains(&".DS_Store"),
+            ".DS_Store should be excluded in incremental walk"
+        );
     }
 }

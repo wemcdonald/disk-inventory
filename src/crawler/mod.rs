@@ -84,6 +84,107 @@ pub fn run_crawl(db: &Database, root: &Path, config: &Config) -> Result<ScanInfo
     Ok(scan_info)
 }
 
+/// Run an incremental crawl: only descend into directories whose mtime
+/// has changed since the last scan. Much faster than a full crawl when
+/// most of the filesystem is static.
+///
+/// Falls back to a full crawl if no previous scan exists.
+pub fn run_incremental_crawl(db: &Database, root: &Path, config: &Config) -> Result<ScanInfo> {
+    // Check if we have a previous scan
+    let prev_scan = db.latest_scan()?;
+    let prev_scan_time = match prev_scan {
+        Some(ref scan) if scan.root_path == root.to_string_lossy() => scan.started_at,
+        _ => {
+            tracing::info!("No previous scan found, running full crawl");
+            return run_crawl(db, root, config);
+        }
+    };
+
+    let root_path = root.to_string_lossy().to_string();
+    let scan_id = db.create_scan(&root_path)?;
+
+    tracing::info!(
+        "Starting incremental crawl of {} (since timestamp {})",
+        root_path,
+        prev_scan_time
+    );
+
+    // Phase 1: Incremental walk — only descend into changed directories
+    db.enable_bulk_mode()?;
+    let (entries, dirs_scanned, dirs_skipped) =
+        walker::walk_directory_incremental(root, scan_id, config, prev_scan_time)?;
+
+    for chunk in entries.chunks(10_000) {
+        db.insert_files(chunk)?;
+    }
+    db.disable_bulk_mode()?;
+
+    tracing::info!(
+        "Incremental walk: {} entries found, {} dirs scanned, {} dirs skipped",
+        entries.len(),
+        dirs_scanned,
+        dirs_skipped
+    );
+
+    // Phase 2: Mark deletions
+    tracing::info!("Phase 2: Marking deleted entries");
+    let deleted_count = db.mark_deleted(scan_id, &root_path)?;
+    tracing::info!("Phase 2 complete: {} entries marked deleted", deleted_count);
+
+    // Phase 3-5: Same as full crawl
+    tracing::info!("Phase 3: Computing directory sizes");
+    let dir_sizes = compute_dir_sizes(&entries, scan_id);
+    db.insert_dir_sizes(&dir_sizes)?;
+    tracing::info!("Phase 3 complete: {} directory sizes computed", dir_sizes.len());
+
+    tracing::info!("Phase 4: Computing extension statistics");
+    db.compute_extension_stats(scan_id)?;
+    tracing::info!("Phase 4 complete");
+
+    tracing::info!("Phase 5: Recording size history");
+    db.record_size_history(scan_id, 10 * 1024 * 1024)?;
+    tracing::info!("Phase 5 complete");
+
+    // Phase 6: Complete scan
+    tracing::info!("Phase 6: Finalizing scan");
+    let total_files = entries
+        .iter()
+        .filter(|e| e.file_type == FileType::File)
+        .count() as u64;
+    let total_dirs = entries
+        .iter()
+        .filter(|e| e.file_type == FileType::Directory)
+        .count() as u64;
+    let total_size: u64 = entries
+        .iter()
+        .filter(|e| e.file_type == FileType::File)
+        .map(|e| e.size_bytes)
+        .sum();
+
+    let stats = ScanStats {
+        total_files,
+        total_dirs,
+        total_size,
+        files_added: 0,
+        files_modified: 0,
+        files_deleted: deleted_count,
+    };
+    db.complete_scan(scan_id, &stats)?;
+
+    let scan_info = db
+        .latest_scan()?
+        .ok_or_else(|| anyhow::anyhow!("scan not found after completion"))?;
+
+    tracing::info!(
+        "Incremental crawl complete: {} files, {} dirs, {} bytes",
+        total_files,
+        total_dirs,
+        total_size
+    );
+
+    Ok(scan_info)
+}
+
 /// Compute directory sizes via bottom-up aggregation.
 ///
 /// For each directory, total_size includes all files recursively beneath it,
@@ -382,5 +483,67 @@ mod tests {
         // Verify extension stats exist
         let ext_stats = db.extension_stats(scan_info.id, 100).unwrap();
         assert!(!ext_stats.is_empty(), "should have extension stats");
+    }
+
+    #[test]
+    fn test_incremental_crawl_skips_unchanged() {
+        let dir = create_test_tree();
+        let r = dir.path();
+
+        let db = Database::open_in_memory().unwrap();
+        let config = Config::default();
+
+        // First: full crawl
+        let scan1 = run_crawl(&db, r, &config).unwrap();
+        assert_eq!(scan1.status, ScanStatus::Completed);
+        assert!(scan1.total_files >= 4);
+
+        // Wait a moment, then add a new file ONLY in root
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        std::fs::write(r.join("new_file.txt"), "new content").unwrap();
+
+        // Incremental crawl should detect the new file
+        let scan2 = run_incremental_crawl(&db, r, &config).unwrap();
+        assert_eq!(scan2.status, ScanStatus::Completed);
+
+        // The new file should be found in the entries from the incremental scan
+        // (it was added to root, which will have a newer mtime)
+        assert!(scan2.total_files >= 1, "incremental scan should find at least the new file");
+    }
+
+    #[test]
+    fn test_incremental_falls_back_to_full() {
+        // No previous scan — should fall back to full crawl
+        let dir = create_test_tree();
+
+        let db = Database::open_in_memory().unwrap();
+        let config = Config::default();
+
+        // No prior scan exists — should fall back to full crawl
+        let scan = run_incremental_crawl(&db, dir.path(), &config).unwrap();
+        assert_eq!(scan.status, ScanStatus::Completed);
+        assert!(scan.total_files >= 4, "fallback full crawl should find all files");
+        assert!(scan.total_dirs >= 2, "fallback full crawl should find all dirs");
+    }
+
+    #[test]
+    fn test_incremental_crawl_different_root_falls_back() {
+        // Previous scan exists but for a different root path
+        let dir1 = TempDir::new().unwrap();
+        std::fs::write(dir1.path().join("a.txt"), "aaa").unwrap();
+
+        let dir2 = TempDir::new().unwrap();
+        std::fs::write(dir2.path().join("b.txt"), "bbb").unwrap();
+
+        let db = Database::open_in_memory().unwrap();
+        let config = Config::default();
+
+        // Scan dir1
+        let _scan1 = run_crawl(&db, dir1.path(), &config).unwrap();
+
+        // Incremental on dir2 — different root, should fall back to full
+        let scan2 = run_incremental_crawl(&db, dir2.path(), &config).unwrap();
+        assert_eq!(scan2.status, ScanStatus::Completed);
+        assert!(scan2.total_files >= 1);
     }
 }

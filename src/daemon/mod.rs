@@ -24,6 +24,31 @@ pub fn run_once(config: &Config) -> Result<()> {
     Ok(())
 }
 
+/// Run a single incremental crawl (preferred for subsequent scans).
+pub fn run_incremental(config: &Config) -> Result<()> {
+    let db = Database::open(config.db_path())?;
+
+    for watch_path in config.resolved_watch_paths() {
+        if !watch_path.exists() {
+            tracing::warn!(
+                "Watch path does not exist, skipping: {}",
+                watch_path.display()
+            );
+            continue;
+        }
+        tracing::info!("Incremental crawl of {}", watch_path.display());
+        let scan = crawler::run_incremental_crawl(&db, &watch_path, config)?;
+        tracing::info!(
+            "Incremental crawl complete: {} files, {} dirs, {}",
+            scan.total_files,
+            scan.total_dirs,
+            format_size(scan.total_size),
+        );
+    }
+
+    Ok(())
+}
+
 /// Print daemon/scan status.
 pub fn show_status(config: &Config) -> Result<()> {
     let db_path = config.db_path();

@@ -1568,4 +1568,75 @@ mod tests {
             "should return empty trends when no history data"
         );
     }
+
+    #[test]
+    fn test_compact_history_weekly() {
+        let db = Database::open_in_memory().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        let conn = db.conn();
+
+        // Insert daily entries for a path spanning 35-55 days ago
+        // (should be compacted to weekly since it's between 30-180 days old)
+        for day in 35..55 {
+            let ts = now - (day * 86400);
+            conn.execute(
+                "INSERT INTO size_history (path, scan_id, recorded_at, total_size, file_count, delta_size, delta_files) VALUES (?1, ?2, ?3, ?4, ?5, 0, 0)",
+                params!["/test/dir", day, ts, 1000 + day * 10, 5],
+            )
+            .unwrap();
+        }
+
+        // Insert recent entries (should NOT be compacted)
+        for day in 0..5 {
+            let ts = now - (day * 86400);
+            conn.execute(
+                "INSERT INTO size_history (path, scan_id, recorded_at, total_size, file_count, delta_size, delta_files) VALUES (?1, ?2, ?3, ?4, ?5, 0, 0)",
+                params!["/test/dir", 100 + day, ts, 2000, 5],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let total_before: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM size_history", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(total_before, 25); // 20 old + 5 recent
+
+        let stats = db.compact_history(30).unwrap();
+
+        // Recent entries (5) should be untouched
+        // Old entries (20 daily over ~3 weeks) should be compacted to ~3 weekly entries
+        assert!(
+            stats.entries_after < stats.entries_before,
+            "compaction should reduce entries"
+        );
+        assert!(
+            stats.weekly_compacted > 0,
+            "should have weekly compactions"
+        );
+
+        // Recent entries should still be there
+        let recent_count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM size_history WHERE recorded_at > ?1",
+                params![now - 10 * 86400],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(recent_count, 5, "recent entries should be preserved");
+    }
+
+    #[test]
+    fn test_compact_history_empty_table() {
+        let db = Database::open_in_memory().unwrap();
+        let stats = db.compact_history(30).unwrap();
+        assert_eq!(stats.entries_before, 0);
+        assert_eq!(stats.entries_after, 0);
+    }
 }

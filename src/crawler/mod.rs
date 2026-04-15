@@ -74,6 +74,19 @@ pub fn run_crawl(db: &Database, root: &Path, config: &Config) -> Result<ScanInfo
 
     db.complete_scan(scan_id, &stats)?;
 
+    // Phase 7: Compact history
+    tracing::info!("Phase 7: Compacting history");
+    let compaction = db.compact_history(config.database.history_retention_days)?;
+    if compaction.weekly_compacted > 0 || compaction.monthly_compacted > 0 {
+        tracing::info!(
+            "History compacted: {} weekly, {} monthly removed ({} -> {} entries)",
+            compaction.weekly_compacted,
+            compaction.monthly_compacted,
+            compaction.entries_before,
+            compaction.entries_after,
+        );
+    }
+
     let scan_info = db
         .latest_scan()?
         .expect("scan should exist after completion");
@@ -170,6 +183,19 @@ pub fn run_incremental_crawl(db: &Database, root: &Path, config: &Config) -> Res
         files_deleted: deleted_count,
     };
     db.complete_scan(scan_id, &stats)?;
+
+    // Phase 7: Compact history
+    tracing::info!("Phase 7: Compacting history");
+    let compaction = db.compact_history(config.database.history_retention_days)?;
+    if compaction.weekly_compacted > 0 || compaction.monthly_compacted > 0 {
+        tracing::info!(
+            "History compacted: {} weekly, {} monthly removed ({} -> {} entries)",
+            compaction.weekly_compacted,
+            compaction.monthly_compacted,
+            compaction.entries_before,
+            compaction.entries_after,
+        );
+    }
 
     let scan_info = db
         .latest_scan()?

@@ -49,6 +49,15 @@ pub struct TrendEntry {
     pub file_count_change: i64,
 }
 
+/// Statistics returned by history compaction.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CompactionStats {
+    pub entries_before: u64,
+    pub entries_after: u64,
+    pub weekly_compacted: u64,
+    pub monthly_compacted: u64,
+}
+
 // ---------------------------------------------------------------------------
 // Helper functions
 // ---------------------------------------------------------------------------
@@ -900,6 +909,81 @@ impl Database {
             result.push(r?);
         }
         Ok(result)
+    }
+
+    // -----------------------------------------------------------------------
+    // History compaction
+    // -----------------------------------------------------------------------
+
+    /// Compact old size_history entries:
+    /// - Keep daily entries for the last `retention_days` days
+    /// - Roll up to weekly for `retention_days` .. 6 months old
+    /// - Roll up to monthly for 6+ months old
+    ///
+    /// Compaction works by:
+    /// 1. For weekly: group entries by (path, week_number), keep the latest per group
+    /// 2. For monthly: group entries by (path, year_month), keep the latest per group
+    /// 3. Delete the non-kept entries
+    pub fn compact_history(&self, retention_days: u32) -> Result<CompactionStats> {
+        let conn = self.conn();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        let daily_cutoff = now - (retention_days as i64 * 86400);
+        let weekly_cutoff = now - (180 * 86400); // 6 months
+
+        // Count before
+        let total_before: i64 =
+            conn.query_row("SELECT COUNT(*) FROM size_history", [], |r| r.get(0))?;
+
+        // Step 1: Weekly compaction (retention_days - 6 months old)
+        // For each (path, week), keep only the entry with the latest recorded_at.
+        // Delete entries that are NOT the latest per (path, week) in this range.
+        let weekly_deleted = conn.execute(
+            "DELETE FROM size_history
+             WHERE recorded_at < ?1 AND recorded_at >= ?2
+             AND rowid NOT IN (
+                 SELECT rowid FROM (
+                     SELECT rowid, ROW_NUMBER() OVER (
+                         PARTITION BY path, (recorded_at / 604800)
+                         ORDER BY recorded_at DESC
+                     ) as rn
+                     FROM size_history
+                     WHERE recorded_at < ?1 AND recorded_at >= ?2
+                 ) WHERE rn = 1
+             )",
+            params![daily_cutoff, weekly_cutoff],
+        )?;
+
+        // Step 2: Monthly compaction (6+ months old)
+        // For each (path, year-month), keep only the latest entry.
+        let monthly_deleted = conn.execute(
+            "DELETE FROM size_history
+             WHERE recorded_at < ?1
+             AND rowid NOT IN (
+                 SELECT rowid FROM (
+                     SELECT rowid, ROW_NUMBER() OVER (
+                         PARTITION BY path, (recorded_at / 2592000)
+                         ORDER BY recorded_at DESC
+                     ) as rn
+                     FROM size_history
+                     WHERE recorded_at < ?1
+                 ) WHERE rn = 1
+             )",
+            params![weekly_cutoff],
+        )?;
+
+        let total_after: i64 =
+            conn.query_row("SELECT COUNT(*) FROM size_history", [], |r| r.get(0))?;
+
+        Ok(CompactionStats {
+            entries_before: total_before as u64,
+            entries_after: total_after as u64,
+            weekly_compacted: weekly_deleted as u64,
+            monthly_compacted: monthly_deleted as u64,
+        })
     }
 }
 

@@ -77,7 +77,9 @@ Or inside Claude Code, run `/mcp` → "Add new MCP server" → stdio → command
 
 ### Cursor
 
-Add to your Cursor MCP config (Settings → MCP Servers → Add):
+**Via Settings UI:** Cmd+, → Features → MCP → "+ Add New MCP Server" → set name to `disk-inventory`, transport to `stdio`, command to `/path/to/disk-inventory mcp`.
+
+**Via config file:** Add to `~/.cursor/mcp.json` (global) or `.cursor/mcp.json` (project):
 
 ```json
 {
@@ -89,8 +91,6 @@ Add to your Cursor MCP config (Settings → MCP Servers → Add):
   }
 }
 ```
-
-Or add directly to `~/.cursor/mcp.json`.
 
 ### opencode
 

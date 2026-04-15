@@ -8,3 +8,4 @@ pub mod mcp;
 pub mod models;
 pub mod query;
 pub mod waste;
+pub mod watcher;

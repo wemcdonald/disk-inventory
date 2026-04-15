@@ -53,7 +53,7 @@ pub fn run_crawl(db: &Database, root: &Path, config: &Config) -> Result<ScanInfo
     let total_size: u64 = entries
         .iter()
         .filter(|e| e.file_type == FileType::File)
-        .map(|e| e.size_bytes)
+        .map(|e| e.disk_size())
         .sum();
 
     // Helper to report phase progress
@@ -204,7 +204,7 @@ pub fn run_incremental_crawl(db: &Database, root: &Path, config: &Config) -> Res
     let total_size: u64 = entries
         .iter()
         .filter(|e| e.file_type == FileType::File)
-        .map(|e| e.size_bytes)
+        .map(|e| e.disk_size())
         .sum();
 
     // Helper to report phase progress
@@ -306,17 +306,18 @@ fn compute_dir_sizes(entries: &[FileEntry], scan_id: i64) -> Vec<DirSize> {
             dir_direct_files.entry(entry.path.clone()).or_insert(0);
             dir_largest_file.entry(entry.path.clone()).or_insert(0);
         } else if entry.file_type == FileType::File {
+            let disk_size = entry.disk_size();
             *dir_direct_size
                 .entry(entry.parent_path.clone())
-                .or_insert(0) += entry.size_bytes;
+                .or_insert(0) += disk_size;
             *dir_direct_files
                 .entry(entry.parent_path.clone())
                 .or_insert(0) += 1;
             let largest = dir_largest_file
                 .entry(entry.parent_path.clone())
                 .or_insert(0);
-            if entry.size_bytes > *largest {
-                *largest = entry.size_bytes;
+            if disk_size > *largest {
+                *largest = disk_size;
             }
         }
     }
@@ -535,16 +536,18 @@ mod tests {
         assert_eq!(dir_sizes.len(), 2);
 
         let sub_size = dir_sizes.iter().find(|d| d.path == "/test/sub").unwrap();
-        assert_eq!(sub_size.total_size, 512 + 10, "sub total = medium.log + tiny.rs");
+        // disk_size = blocks * 512: medium.log = 512, tiny.rs = 512
+        assert_eq!(sub_size.total_size, 512 + 512, "sub total = medium.log(1 block) + tiny.rs(1 block)");
         assert_eq!(sub_size.file_count, 2);
         assert_eq!(sub_size.dir_count, 0);
         assert_eq!(sub_size.largest_file, 512);
 
         let root_size = dir_sizes.iter().find(|d| d.path == "/test").unwrap();
+        // big.bin = 2*512=1024, small.txt = 1*512=512, medium.log = 512, tiny.rs = 512
         assert_eq!(
             root_size.total_size,
-            1024 + 5 + 512 + 10,
-            "root total = all files recursively"
+            1024 + 512 + 512 + 512,
+            "root total = all files (disk_size = blocks*512)"
         );
         assert_eq!(root_size.file_count, 4);
         assert_eq!(root_size.dir_count, 1, "root has 1 child dir: sub");

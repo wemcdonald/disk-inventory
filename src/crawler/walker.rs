@@ -36,6 +36,13 @@ pub fn walk_directory(
     let mut dir_count: u64 = 0;
     let mut byte_count: u64 = 0;
 
+    // Get root device ID for cross-filesystem detection
+    let root_device_id = if !config.scanner.cross_filesystems {
+        platform::get_metadata(root).ok().map(|m| m.device_id)
+    } else {
+        None
+    };
+
     let walker = jwalk::WalkDir::new(root)
         .skip_hidden(false)
         .sort(false)
@@ -78,6 +85,14 @@ pub fn walk_directory(
             }
         };
 
+        // Cross-filesystem check: skip entries on different devices
+        if let Some(root_dev) = root_device_id {
+            if meta.device_id != root_dev {
+                tracing::debug!("skipping cross-device entry: {}", path_str);
+                continue;
+            }
+        }
+
         let extension = if meta.file_type == FileType::File {
             extract_extension(&name)
         } else {
@@ -99,7 +114,8 @@ pub fn walk_directory(
         // Track progress
         if meta.file_type == FileType::File {
             file_count += 1;
-            byte_count += meta.size_bytes;
+            // Use disk_size (blocks*512) for accurate reporting
+            byte_count += if meta.blocks > 0 { meta.blocks * 512 } else { meta.size_bytes };
         } else if meta.file_type == FileType::Directory {
             dir_count += 1;
         }

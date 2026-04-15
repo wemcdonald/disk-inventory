@@ -57,6 +57,20 @@ pub struct FileEntry {
     pub path_components: u32,
 }
 
+impl FileEntry {
+    /// Actual disk consumption in bytes.
+    /// Uses allocated blocks (blocks * 512) which accounts for APFS clones,
+    /// sparse files, and compression. Falls back to logical size if blocks is 0
+    /// (e.g., on non-Unix platforms).
+    pub fn disk_size(&self) -> u64 {
+        if self.blocks > 0 {
+            self.blocks * 512
+        } else {
+            self.size_bytes
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // DirSize
 // ---------------------------------------------------------------------------

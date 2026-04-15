@@ -4,6 +4,18 @@ Fast, AI-friendly disk usage analysis. Crawls your filesystem into a SQLite inde
 
 Think ncdu meets Disk Inventory X, but queryable by an AI.
 
+> Where can I free up 20GB?
+
+`⏺ disk-inventory: find_waste`
+
+You've got plenty of safe options:
+
+- **node_modules** — 78 GB across 47 projects (`rm -rf`, `npm install` regenerates)
+- **build artifacts** — 64 GB in Rust `target/` dirs (`cargo clean`)
+- **package caches** — 21 GB in npm/pip/Homebrew caches (`brew cleanup`, `pip cache purge`)
+
+Any one of those clears 20 GB. The node_modules and build artifacts are fully regenerable. Want me to help you find which of those you haven't touched in a while?
+
 ## Quick Start
 
 ```bash

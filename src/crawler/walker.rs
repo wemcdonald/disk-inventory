@@ -4,6 +4,21 @@ use crate::models::*;
 use anyhow::Result;
 use std::path::Path;
 
+/// Check if an I/O error is harmless and expected during filesystem crawling.
+/// These get demoted to debug level instead of warn.
+fn is_harmless_io_error(e: &dyn std::fmt::Display) -> bool {
+    let msg = e.to_string();
+    // ENOENT: file vanished between readdir and stat (Spotlight, tmp files)
+    msg.contains("No such file or directory")
+    // ETIMEDOUT: network mount not responding
+    || msg.contains("Operation timed out")
+    // ESTALE: NFS handle gone
+    || msg.contains("Stale NFS file handle")
+    // EACCES on system-protected paths
+    || msg.contains("Operation not permitted")
+    || msg.contains("Permission denied")
+}
+
 /// Walk a directory tree and collect FileEntry records.
 ///
 /// Uses jwalk for parallel directory traversal and delegates per-entry
@@ -31,7 +46,11 @@ pub fn walk_directory(
         let dir_entry = match result {
             Ok(entry) => entry,
             Err(e) => {
-                tracing::warn!("walk error: {}", e);
+                if is_harmless_io_error(&e) {
+                    tracing::debug!("walk error (skipped): {}", e);
+                } else {
+                    tracing::warn!("walk error: {}", e);
+                }
                 continue;
             }
         };
@@ -50,7 +69,11 @@ pub fn walk_directory(
         let meta = match platform::get_metadata(&path) {
             Ok(m) => m,
             Err(e) => {
-                tracing::warn!("metadata error for {}: {}", path_str, e);
+                if is_harmless_io_error(&e) {
+                    tracing::debug!("metadata error (skipped): {}: {}", path_str, e);
+                } else {
+                    tracing::warn!("metadata error for {}: {}", path_str, e);
+                }
                 continue;
             }
         };
@@ -172,7 +195,11 @@ fn build_file_entry(
     let meta = match platform::get_metadata(path) {
         Ok(m) => m,
         Err(e) => {
-            tracing::warn!("metadata error for {}: {}", path_str, e);
+            if is_harmless_io_error(&e) {
+                tracing::debug!("metadata error (skipped): {}: {}", path_str, e);
+            } else {
+                tracing::warn!("metadata error for {}: {}", path_str, e);
+            }
             return None;
         }
     };
@@ -245,7 +272,11 @@ fn walk_recursive(
     let dir_meta = match platform::get_metadata(dir) {
         Ok(m) => m,
         Err(e) => {
-            tracing::warn!("Cannot stat directory {}: {}", dir.display(), e);
+            if is_harmless_io_error(&e) {
+                tracing::debug!("cannot stat directory (skipped): {}: {}", dir.display(), e);
+            } else {
+                tracing::warn!("Cannot stat directory {}: {}", dir.display(), e);
+            }
             return Ok(());
         }
     };
@@ -319,7 +350,11 @@ fn walk_recursive(
                 let entry = match entry_result {
                     Ok(e) => e,
                     Err(e) => {
-                        tracing::warn!("readdir error in {}: {}", dir.display(), e);
+                        if is_harmless_io_error(&e) {
+                            tracing::debug!("readdir error (skipped): {}: {}", dir.display(), e);
+                        } else {
+                            tracing::warn!("readdir error in {}: {}", dir.display(), e);
+                        }
                         continue;
                     }
                 };

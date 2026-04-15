@@ -687,6 +687,6 @@ mod tests {
     #[test]
     fn test_built_in_rules_count() {
         let rules = rules::built_in_rules();
-        assert_eq!(rules.len(), 17, "should have 17 built-in waste rules");
+        assert_eq!(rules.len(), 19, "should have 19 built-in waste rules");
     }
 }

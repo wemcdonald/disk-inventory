@@ -186,5 +186,25 @@ pub fn built_in_rules() -> Vec<WasteRule> {
             cleanup: None,
             description: "Application caches. Most apps regenerate these automatically.",
         },
+        WasteRule {
+            name: "Yarn cache",
+            category: "package_caches",
+            dir_names: &[],
+            file_extensions: &[],
+            path_contains: &["/.yarn/cache", "/.cache/yarn"],
+            safety: SafetyRating::Safe,
+            cleanup: Some("yarn cache clean"),
+            description: "Yarn package manager download cache.",
+        },
+        WasteRule {
+            name: "Old downloads",
+            category: "old_downloads",
+            dir_names: &[],
+            file_extensions: &[],
+            path_contains: &["/Downloads/"],
+            safety: SafetyRating::Review,
+            cleanup: None,
+            description: "Files in ~/Downloads older than 90 days. Review before deleting.",
+        },
     ]
 }

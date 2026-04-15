@@ -92,24 +92,28 @@ fn install_launchd(binary: &PathBuf) -> Result<()> {
     let path = plist_path();
     std::fs::write(&path, plist_content)?;
 
-    // Load the service
+    // Try modern `bootstrap` first, fall back to legacy `load`
+    let uid = unsafe { libc::getuid() };
+    let domain_target = format!("gui/{}", uid);
     let status = std::process::Command::new("launchctl")
-        .args(["load", &path.to_string_lossy()])
-        .status()
-        .context("failed to run launchctl load")?;
+        .args(["bootstrap", &domain_target, &path.to_string_lossy()])
+        .status();
 
-    if status.success() {
-        println!("Service installed and started.");
-        println!("  Plist: {}", path.display());
-        println!("  Log:   {}", log_path.display());
-        println!("\nTo check status: disk-inventory daemon status");
-        println!("To stop:         disk-inventory daemon uninstall");
-    } else {
-        anyhow::bail!(
-            "launchctl load failed with exit code: {:?}",
-            status.code()
-        );
+    match status {
+        Ok(s) if s.success() => {}
+        _ => {
+            // Fall back to legacy load for older macOS
+            let _ = std::process::Command::new("launchctl")
+                .args(["load", &path.to_string_lossy()])
+                .status();
+        }
     }
+
+    println!("Service installed and started.");
+    println!("  Plist: {}", path.display());
+    println!("  Log:   {}", log_path.display());
+    println!("\nTo check status: disk-inventory daemon status");
+    println!("To stop:         disk-inventory daemon uninstall");
 
     Ok(())
 }
@@ -119,9 +123,17 @@ fn uninstall_launchd() -> Result<()> {
     let path = plist_path();
 
     if path.exists() {
-        let _ = std::process::Command::new("launchctl")
-            .args(["unload", &path.to_string_lossy()])
+        // Try modern `bootout` first, fall back to legacy `unload`
+        let uid = unsafe { libc::getuid() };
+        let service_target = format!("gui/{}/{}", uid, LABEL);
+        let status = std::process::Command::new("launchctl")
+            .args(["bootout", &service_target])
             .status();
+        if !matches!(status, Ok(s) if s.success()) {
+            let _ = std::process::Command::new("launchctl")
+                .args(["unload", &path.to_string_lossy()])
+                .status();
+        }
 
         std::fs::remove_file(&path)?;
         println!("Service uninstalled.");

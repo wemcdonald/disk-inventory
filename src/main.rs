@@ -126,7 +126,26 @@ enum DaemonAction {
     /// Remove system service
     Uninstall,
     /// Show daemon status
-    Status,
+    Status {
+        /// Continuously refresh status (like watch/top)
+        #[arg(short, long)]
+        watch: bool,
+        /// Wait for active scan to complete, showing progress
+        #[arg(long)]
+        wait: bool,
+        /// Output format
+        #[arg(short = 'f', long, value_enum, default_value = "table")]
+        format: OutputFormat,
+    },
+    /// Show daemon log output
+    Log {
+        /// Number of lines to show (default: 50)
+        #[arg(short = 'n', long, default_value = "50")]
+        lines: usize,
+        /// Follow log output (like tail -f)
+        #[arg(short, long)]
+        follow: bool,
+    },
     /// Trigger an immediate rescan via IPC
     Rescan {
         /// Optional path to rescan (defaults to all watch paths)
@@ -195,9 +214,19 @@ fn main() -> anyhow::Result<()> {
                 disk_inventory::daemon::service::uninstall()?;
                 Ok(())
             }
-            DaemonAction::Status => {
+            DaemonAction::Status { watch, wait, format } => {
                 let config = disk_inventory::config::Config::load()?;
-                disk_inventory::daemon::show_status(&config)?;
+                if watch {
+                    disk_inventory::daemon::show_status_watch(&config)?;
+                } else if wait {
+                    disk_inventory::daemon::wait_for_scan(&config)?;
+                } else {
+                    disk_inventory::daemon::show_status(&config, &format)?;
+                }
+                Ok(())
+            }
+            DaemonAction::Log { lines, follow } => {
+                disk_inventory::daemon::show_log(lines, follow)?;
                 Ok(())
             }
             DaemonAction::Rescan { path } => {

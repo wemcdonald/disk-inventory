@@ -200,14 +200,30 @@ pub fn send_ipc_command(command: &str) -> Result<String> {
 }
 
 /// Print daemon/scan status.
-pub fn show_status(config: &Config) -> Result<()> {
+pub fn show_status(config: &Config, format: &crate::cli::OutputFormat) -> Result<()> {
     let db_path = config.db_path();
     if !db_path.exists() {
-        println!("No database found at {}", db_path.display());
-        println!("Run `disk-inventory daemon run` to create the index.");
+        match format {
+            crate::cli::OutputFormat::Json => {
+                println!(r#"{{"status":"no_database"}}"#);
+            }
+            _ => {
+                println!("No database found at {}", db_path.display());
+                println!("Run `disk-inventory daemon run` to create the index.");
+            }
+        }
         return Ok(());
     }
     let db = Database::open(&db_path)?;
+
+    match format {
+        crate::cli::OutputFormat::Json => {
+            let status = crate::query::query_scan_status_full(&db)?;
+            println!("{}", serde_json::to_string_pretty(&status)?);
+            return Ok(());
+        }
+        _ => {}
+    }
 
     // Check for active scan
     if let Some((scan, progress)) = db.active_scan()? {
@@ -252,5 +268,106 @@ pub fn show_status(config: &Config) -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+/// Continuously refresh status every 1 second (like `watch` or `top`).
+pub fn show_status_watch(config: &Config) -> Result<()> {
+    let format = crate::cli::OutputFormat::Table;
+    loop {
+        // Clear screen and move cursor to top-left
+        print!("\x1B[2J\x1B[1;1H");
+        println!("disk-inventory daemon status (refreshing every 1s, Ctrl-C to stop)\n");
+        show_status(config, &format)?;
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+}
+
+/// Block until the current scan completes, showing progress while waiting.
+pub fn wait_for_scan(config: &Config) -> Result<()> {
+    let db_path = config.db_path();
+    if !db_path.exists() {
+        anyhow::bail!("No database found. Is the daemon running?");
+    }
+
+    println!("Waiting for scan to complete...\n");
+
+    loop {
+        let db = Database::open(&db_path)?;
+        match db.active_scan()? {
+            Some((_scan, Some(progress))) => {
+                // Overwrite current line with progress
+                print!("\r\x1B[K");
+                let dir_display = if progress.current_dir.len() > 50 {
+                    format!("...{}", &progress.current_dir[progress.current_dir.len()-47..])
+                } else {
+                    progress.current_dir.clone()
+                };
+                print!(
+                    "Phase {}/{} ({}): {} files, {} dirs, {} — {}",
+                    progress.phase_number,
+                    progress.total_phases,
+                    progress.phase,
+                    progress.files_so_far,
+                    progress.dirs_so_far,
+                    progress.bytes_so_far_human,
+                    dir_display,
+                );
+                use std::io::Write;
+                std::io::stdout().flush()?;
+            }
+            Some((_, None)) => {
+                print!("\r\x1B[KScan running (no progress data yet)...");
+                use std::io::Write;
+                std::io::stdout().flush()?;
+            }
+            None => {
+                println!("\r\x1B[KScan complete!");
+                // Show final stats
+                if let Some(scan) = db.latest_scan()? {
+                    println!(
+                        "  {} files, {} dirs, {}",
+                        scan.total_files,
+                        scan.total_dirs,
+                        format_size(scan.total_size),
+                    );
+                }
+                return Ok(());
+            }
+        }
+        drop(db);
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+}
+
+/// Show daemon log output.
+pub fn show_log(lines: usize, follow: bool) -> Result<()> {
+    let log_path = crate::config::config_dir().join("daemon.log");
+    if !log_path.exists() {
+        anyhow::bail!(
+            "No daemon log found at {}. Is the daemon installed as a service?",
+            log_path.display()
+        );
+    }
+
+    if follow {
+        // Use tail -f
+        let status = std::process::Command::new("tail")
+            .args(["-f", "-n", &lines.to_string()])
+            .arg(&log_path)
+            .status()?;
+        if !status.success() {
+            anyhow::bail!("tail command failed");
+        }
+    } else {
+        // Read last N lines
+        let content = std::fs::read_to_string(&log_path)?;
+        let all_lines: Vec<&str> = content.lines().collect();
+        let start = all_lines.len().saturating_sub(lines);
+        for line in &all_lines[start..] {
+            println!("{}", line);
+        }
+    }
+
     Ok(())
 }

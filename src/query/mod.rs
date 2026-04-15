@@ -342,6 +342,78 @@ pub fn query_scan_status(db: &Database) -> Result<Option<ScanInfo>> {
 }
 
 // ---------------------------------------------------------------------------
+// Trends
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+pub struct TrendsResult {
+    pub trends: Vec<TrendItem>,
+    pub period: String,
+    pub last_scan_time: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TrendItem {
+    pub path: String,
+    pub current_size: u64,
+    pub current_size_human: String,
+    pub previous_size: u64,
+    pub growth_bytes: i64,
+    pub growth_human: String,
+    pub growth_percent: f64,
+    pub file_count_change: i64,
+}
+
+/// Query size trends over a given period.
+pub fn query_trends(
+    db: &Database,
+    path: Option<&str>,
+    period: &str,  // "day", "week", "month", "quarter", "year"
+    sort_by: &str, // "absolute_growth", "growth_rate", "current_size"
+    limit: u32,
+) -> Result<TrendsResult> {
+    let scan = db.latest_scan()?;
+    let last_scan_time = scan.as_ref().and_then(|s| s.completed_at);
+
+    // Convert period to seconds
+    let period_secs: i64 = match period {
+        "day" => 86400,
+        "week" => 7 * 86400,
+        "month" => 30 * 86400,
+        "quarter" => 90 * 86400,
+        "year" => 365 * 86400,
+        _ => 7 * 86400, // default to week
+    };
+    let since = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+        - period_secs;
+
+    let entries = db.query_trends(path, since, limit, sort_by)?;
+
+    let trends = entries
+        .into_iter()
+        .map(|e| TrendItem {
+            path: e.path,
+            current_size: e.current_size,
+            current_size_human: e.current_size_human,
+            previous_size: e.previous_size,
+            growth_bytes: e.growth_bytes,
+            growth_human: e.growth_human,
+            growth_percent: e.growth_percent,
+            file_count_change: e.file_count_change,
+        })
+        .collect();
+
+    Ok(TrendsResult {
+        trends,
+        period: period.to_string(),
+        last_scan_time,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -695,5 +767,18 @@ mod tests {
         let db = Database::open_in_memory().expect("open_in_memory");
         let scan = query_scan_status(&db).expect("query_scan_status");
         assert!(scan.is_none());
+    }
+
+    #[test]
+    fn test_query_trends_empty() {
+        let db = Database::open_in_memory().expect("open_in_memory");
+
+        // No history data -- should return empty trends
+        let result = query_trends(&db, None, "week", "absolute_growth", 10)
+            .expect("query_trends empty");
+
+        assert!(result.trends.is_empty(), "should return empty trends when no data");
+        assert_eq!(result.period, "week");
+        assert!(result.last_scan_time.is_none());
     }
 }

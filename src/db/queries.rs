@@ -580,8 +580,8 @@ impl Database {
                     h.total_size,
                     h.file_count,
                     h.recorded_at,
-                    ROW_NUMBER() OVER (PARTITION BY h.path ORDER BY h.recorded_at ASC) AS rn_asc,
-                    ROW_NUMBER() OVER (PARTITION BY h.path ORDER BY h.recorded_at DESC) AS rn_desc
+                    ROW_NUMBER() OVER (PARTITION BY h.path ORDER BY h.recorded_at ASC, h.scan_id ASC) AS rn_asc,
+                    ROW_NUMBER() OVER (PARTITION BY h.path ORDER BY h.recorded_at DESC, h.scan_id DESC) AS rn_desc
                 FROM size_history h
                 WHERE h.recorded_at >= ?1
                 {path_filter}

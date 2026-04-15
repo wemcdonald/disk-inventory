@@ -41,8 +41,13 @@ pub fn run_crawl(db: &Database, root: &Path, config: &Config) -> Result<ScanInfo
     db.compute_extension_stats(scan_id)?;
     tracing::info!("Phase 4 complete");
 
-    // Phase 5: Complete scan
-    tracing::info!("Phase 5: Finalizing scan");
+    // Phase 5: Record size history
+    tracing::info!("Phase 5: Recording size history");
+    db.record_size_history(scan_id, 10 * 1024 * 1024)?; // 10 MB threshold
+    tracing::info!("Phase 5 complete");
+
+    // Phase 6: Complete scan
+    tracing::info!("Phase 6: Finalizing scan");
     let total_files = entries
         .iter()
         .filter(|e| e.file_type == FileType::File)

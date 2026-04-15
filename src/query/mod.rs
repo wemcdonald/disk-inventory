@@ -2,7 +2,7 @@ use serde::Serialize;
 
 use crate::db::queries::SearchCriteria;
 use crate::db::Database;
-use crate::models::{format_size, FileType, ScanInfo};
+use crate::models::{format_size, FileType, ScanInfo, ScanProgress};
 use anyhow::{Context, Result};
 
 // ---------------------------------------------------------------------------
@@ -339,6 +339,22 @@ pub fn query_search(
 /// Get current scan status.
 pub fn query_scan_status(db: &Database) -> Result<Option<ScanInfo>> {
     db.latest_scan()
+}
+
+#[derive(Debug, Serialize)]
+pub struct ScanStatusResult {
+    pub active_scan: Option<ScanProgress>,
+    pub last_completed_scan: Option<ScanInfo>,
+}
+
+/// Enhanced scan status that includes active scan progress.
+pub fn query_scan_status_full(db: &Database) -> Result<ScanStatusResult> {
+    let active = db.active_scan()?;
+    let completed = db.latest_scan()?;
+    Ok(ScanStatusResult {
+        active_scan: active.and_then(|(_, progress)| progress),
+        last_completed_scan: completed,
+    })
 }
 
 // ---------------------------------------------------------------------------

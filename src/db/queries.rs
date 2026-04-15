@@ -2,8 +2,9 @@ use anyhow::{Context, Result};
 use rusqlite::params;
 
 use crate::models::{
-    DirSize, ExtensionStat, FileEntry, FileType, ScanInfo, ScanStatus,
+    DirSize, ExtensionStat, FileEntry, FileType, ScanInfo, ScanProgress, ScanStatus,
 };
+use rusqlite::OptionalExtension;
 
 use super::Database;
 
@@ -195,6 +196,49 @@ impl Database {
             Some(Err(e)) => Err(e.into()),
             None => Ok(None),
         }
+    }
+
+    /// Update scan progress (called periodically during crawl).
+    pub fn update_scan_progress(&self, scan_id: i64, progress: &ScanProgress) -> Result<()> {
+        let json = serde_json::to_string(progress)?;
+        let conn = self.conn();
+        conn.execute(
+            "UPDATE scans SET progress = ?1 WHERE id = ?2",
+            params![json, scan_id],
+        )?;
+        Ok(())
+    }
+
+    /// Find any currently running scan.
+    pub fn active_scan(&self) -> Result<Option<(ScanInfo, Option<ScanProgress>)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, root_path, started_at, completed_at, total_files, total_dirs,
+                    total_size, files_added, files_modified, files_deleted, status, progress
+             FROM scans WHERE status = 'running' ORDER BY id DESC LIMIT 1",
+        )?;
+        let result = stmt
+            .query_row([], |row| {
+                let status_str: String = row.get(10)?;
+                let progress_json: Option<String> = row.get(11)?;
+                let scan = ScanInfo {
+                    id: row.get(0)?,
+                    root_path: row.get(1)?,
+                    started_at: row.get(2)?,
+                    completed_at: row.get(3)?,
+                    total_files: row.get(4)?,
+                    total_dirs: row.get(5)?,
+                    total_size: row.get(6)?,
+                    files_added: row.get(7)?,
+                    files_modified: row.get(8)?,
+                    files_deleted: row.get(9)?,
+                    status: ScanStatus::from_str(&status_str).unwrap_or(ScanStatus::Running),
+                };
+                let progress = progress_json.and_then(|j| serde_json::from_str(&j).ok());
+                Ok((scan, progress))
+            })
+            .optional()?;
+        Ok(result)
     }
 
     // -----------------------------------------------------------------------
@@ -1638,5 +1682,120 @@ mod tests {
         let stats = db.compact_history(30).unwrap();
         assert_eq!(stats.entries_before, 0);
         assert_eq!(stats.entries_after, 0);
+    }
+
+    #[test]
+    fn test_update_and_read_scan_progress() {
+        let db = Database::open_in_memory().unwrap();
+        let scan_id = db.create_scan("/test").unwrap();
+
+        let progress = ScanProgress {
+            phase: "walking".to_string(),
+            phase_number: 1,
+            total_phases: 7,
+            files_so_far: 12345,
+            dirs_so_far: 89,
+            bytes_so_far: 456789,
+            bytes_so_far_human: "446.1 KiB".to_string(),
+            current_dir: "/test/some/path".to_string(),
+            elapsed_secs: 10,
+        };
+
+        db.update_scan_progress(scan_id, &progress).unwrap();
+
+        let result = db.active_scan().unwrap();
+        assert!(result.is_some(), "should find the running scan");
+
+        let (scan, progress_opt) = result.unwrap();
+        assert_eq!(scan.id, scan_id);
+        assert_eq!(scan.root_path, "/test");
+        assert_eq!(scan.status, ScanStatus::Running);
+
+        let p = progress_opt.expect("progress should be present");
+        assert_eq!(p.phase, "walking");
+        assert_eq!(p.phase_number, 1);
+        assert_eq!(p.total_phases, 7);
+        assert_eq!(p.files_so_far, 12345);
+        assert_eq!(p.dirs_so_far, 89);
+        assert_eq!(p.bytes_so_far, 456789);
+        assert_eq!(p.current_dir, "/test/some/path");
+        assert_eq!(p.elapsed_secs, 10);
+    }
+
+    #[test]
+    fn test_active_scan_none_when_completed() {
+        let db = Database::open_in_memory().unwrap();
+        let scan_id = db.create_scan("/test").unwrap();
+
+        // Write some progress
+        let progress = ScanProgress {
+            phase: "walking".to_string(),
+            phase_number: 1,
+            total_phases: 7,
+            files_so_far: 100,
+            ..Default::default()
+        };
+        db.update_scan_progress(scan_id, &progress).unwrap();
+
+        // Now complete the scan
+        let stats = ScanStats {
+            total_files: 100,
+            total_dirs: 10,
+            total_size: 5000,
+            files_added: 100,
+            files_modified: 0,
+            files_deleted: 0,
+        };
+        db.complete_scan(scan_id, &stats).unwrap();
+
+        // active_scan should return None because the scan is completed
+        let result = db.active_scan().unwrap();
+        assert!(result.is_none(), "completed scans should not show as active");
+    }
+
+    #[test]
+    fn test_scan_status_full_during_scan() {
+        let db = Database::open_in_memory().unwrap();
+
+        // First, create and complete a scan
+        let scan_id_1 = db.create_scan("/test").unwrap();
+        let stats = ScanStats {
+            total_files: 50,
+            total_dirs: 5,
+            total_size: 2500,
+            files_added: 50,
+            files_modified: 0,
+            files_deleted: 0,
+        };
+        db.complete_scan(scan_id_1, &stats).unwrap();
+
+        // Now start a second scan (still running)
+        let scan_id_2 = db.create_scan("/test").unwrap();
+        let progress = ScanProgress {
+            phase: "walking".to_string(),
+            phase_number: 1,
+            total_phases: 7,
+            files_so_far: 200,
+            dirs_so_far: 20,
+            bytes_so_far: 999999,
+            bytes_so_far_human: "976.6 KiB".to_string(),
+            current_dir: "/test/deep/dir".to_string(),
+            elapsed_secs: 5,
+        };
+        db.update_scan_progress(scan_id_2, &progress).unwrap();
+
+        // Use the query layer function
+        let result = crate::query::query_scan_status_full(&db).unwrap();
+
+        // Should have both an active scan and a completed scan
+        assert!(result.active_scan.is_some(), "should have active scan progress");
+        let active = result.active_scan.unwrap();
+        assert_eq!(active.phase, "walking");
+        assert_eq!(active.files_so_far, 200);
+
+        assert!(result.last_completed_scan.is_some(), "should have last completed scan");
+        let completed = result.last_completed_scan.unwrap();
+        assert_eq!(completed.id, scan_id_1);
+        assert_eq!(completed.total_files, 50);
     }
 }

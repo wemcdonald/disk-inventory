@@ -56,7 +56,8 @@ pub fn create_schema(conn: &Connection) -> anyhow::Result<()> {
             files_added     INTEGER DEFAULT 0,
             files_modified  INTEGER DEFAULT 0,
             files_deleted   INTEGER DEFAULT 0,
-            status          TEXT DEFAULT 'running'
+            status          TEXT DEFAULT 'running',
+            progress        TEXT
         );
 
         -- Historical size snapshots per directory
@@ -125,6 +126,11 @@ pub fn create_schema(conn: &Connection) -> anyhow::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_history_delta ON size_history(delta_size DESC) WHERE delta_size != 0;
         ",
     )?;
+
+    // Migration: add `progress` column to existing databases that lack it.
+    // ALTER TABLE … ADD COLUMN is a no-op if the column already exists on
+    // newer SQLite versions, but older ones may error — so we ignore errors.
+    let _ = conn.execute_batch("ALTER TABLE scans ADD COLUMN progress TEXT;");
 
     Ok(())
 }

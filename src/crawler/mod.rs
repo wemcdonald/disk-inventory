@@ -13,10 +13,25 @@ use std::path::Path;
 pub fn run_crawl(db: &Database, root: &Path, config: &Config) -> Result<ScanInfo> {
     let root_path = root.to_string_lossy().to_string();
     let scan_id = db.create_scan(&root_path)?;
+    let start_time = std::time::Instant::now();
 
     // Phase 1: Walk & Insert
     tracing::info!("Phase 1: Walking filesystem at {}", root_path);
-    let entries = walker::walk_directory(root, scan_id, config)?;
+    let progress_cb = |files: u64, dirs: u64, bytes: u64, current_dir: &str| {
+        let progress = ScanProgress {
+            phase: "walking".to_string(),
+            phase_number: 1,
+            total_phases: 7,
+            files_so_far: files,
+            dirs_so_far: dirs,
+            bytes_so_far: bytes,
+            bytes_so_far_human: format_size(bytes),
+            current_dir: current_dir.to_string(),
+            elapsed_secs: start_time.elapsed().as_secs(),
+        };
+        let _ = db.update_scan_progress(scan_id, &progress);
+    };
+    let entries = walker::walk_directory(root, scan_id, config, Some(&progress_cb))?;
 
     db.enable_bulk_mode()?;
     for chunk in entries.chunks(10_000) {
@@ -26,29 +41,7 @@ pub fn run_crawl(db: &Database, root: &Path, config: &Config) -> Result<ScanInfo
 
     tracing::info!("Phase 1 complete: {} entries found", entries.len());
 
-    // Phase 2: Mark deletions
-    tracing::info!("Phase 2: Marking deleted entries");
-    let deleted_count = db.mark_deleted(scan_id, &root_path)?;
-    tracing::info!("Phase 2 complete: {} entries marked deleted", deleted_count);
-
-    // Phase 3: Compute dir_sizes
-    tracing::info!("Phase 3: Computing directory sizes");
-    let dir_sizes = compute_dir_sizes(&entries, scan_id);
-    db.insert_dir_sizes(&dir_sizes)?;
-    tracing::info!("Phase 3 complete: {} directory sizes computed", dir_sizes.len());
-
-    // Phase 4: Compute extension stats
-    tracing::info!("Phase 4: Computing extension statistics");
-    db.compute_extension_stats(scan_id)?;
-    tracing::info!("Phase 4 complete");
-
-    // Phase 5: Record size history
-    tracing::info!("Phase 5: Recording size history");
-    db.record_size_history(scan_id, 10 * 1024 * 1024)?; // 10 MB threshold
-    tracing::info!("Phase 5 complete");
-
-    // Phase 6: Complete scan
-    tracing::info!("Phase 6: Finalizing scan");
+    // Pre-compute totals for progress reporting
     let total_files = entries
         .iter()
         .filter(|e| e.file_type == FileType::File)
@@ -63,6 +56,50 @@ pub fn run_crawl(db: &Database, root: &Path, config: &Config) -> Result<ScanInfo
         .map(|e| e.size_bytes)
         .sum();
 
+    // Helper to report phase progress
+    let report_phase = |phase: &str, phase_number: u8| {
+        let _ = db.update_scan_progress(scan_id, &ScanProgress {
+            phase: phase.to_string(),
+            phase_number,
+            total_phases: 7,
+            files_so_far: total_files,
+            dirs_so_far: total_dirs,
+            bytes_so_far: total_size,
+            bytes_so_far_human: format_size(total_size),
+            current_dir: String::new(),
+            elapsed_secs: start_time.elapsed().as_secs(),
+        });
+    };
+
+    // Phase 2: Mark deletions
+    report_phase("marking_deletions", 2);
+    tracing::info!("Phase 2: Marking deleted entries");
+    let deleted_count = db.mark_deleted(scan_id, &root_path)?;
+    tracing::info!("Phase 2 complete: {} entries marked deleted", deleted_count);
+
+    // Phase 3: Compute dir_sizes
+    report_phase("computing_dir_sizes", 3);
+    tracing::info!("Phase 3: Computing directory sizes");
+    let dir_sizes = compute_dir_sizes(&entries, scan_id);
+    db.insert_dir_sizes(&dir_sizes)?;
+    tracing::info!("Phase 3 complete: {} directory sizes computed", dir_sizes.len());
+
+    // Phase 4: Compute extension stats
+    report_phase("computing_extension_stats", 4);
+    tracing::info!("Phase 4: Computing extension statistics");
+    db.compute_extension_stats(scan_id)?;
+    tracing::info!("Phase 4 complete");
+
+    // Phase 5: Record size history
+    report_phase("recording_size_history", 5);
+    tracing::info!("Phase 5: Recording size history");
+    db.record_size_history(scan_id, 10 * 1024 * 1024)?; // 10 MB threshold
+    tracing::info!("Phase 5 complete");
+
+    // Phase 6: Complete scan
+    report_phase("finalizing", 6);
+    tracing::info!("Phase 6: Finalizing scan");
+
     let stats = ScanStats {
         total_files,
         total_dirs,
@@ -75,6 +112,7 @@ pub fn run_crawl(db: &Database, root: &Path, config: &Config) -> Result<ScanInfo
     db.complete_scan(scan_id, &stats)?;
 
     // Phase 7: Compact history
+    report_phase("compacting_history", 7);
     tracing::info!("Phase 7: Compacting history");
     let compaction = db.compact_history(config.database.history_retention_days)?;
     if compaction.weekly_compacted > 0 || compaction.monthly_compacted > 0 {
@@ -115,6 +153,7 @@ pub fn run_incremental_crawl(db: &Database, root: &Path, config: &Config) -> Res
 
     let root_path = root.to_string_lossy().to_string();
     let scan_id = db.create_scan(&root_path)?;
+    let start_time = std::time::Instant::now();
 
     tracing::info!(
         "Starting incremental crawl of {} (since timestamp {})",
@@ -124,8 +163,22 @@ pub fn run_incremental_crawl(db: &Database, root: &Path, config: &Config) -> Res
 
     // Phase 1: Incremental walk — only descend into changed directories
     db.enable_bulk_mode()?;
+    let progress_cb = |files: u64, dirs: u64, bytes: u64, current_dir: &str| {
+        let progress = ScanProgress {
+            phase: "walking_incremental".to_string(),
+            phase_number: 1,
+            total_phases: 7,
+            files_so_far: files,
+            dirs_so_far: dirs,
+            bytes_so_far: bytes,
+            bytes_so_far_human: format_size(bytes),
+            current_dir: current_dir.to_string(),
+            elapsed_secs: start_time.elapsed().as_secs(),
+        };
+        let _ = db.update_scan_progress(scan_id, &progress);
+    };
     let (entries, dirs_scanned, dirs_skipped) =
-        walker::walk_directory_incremental(root, scan_id, config, prev_scan_time)?;
+        walker::walk_directory_incremental(root, scan_id, config, prev_scan_time, Some(&progress_cb))?;
 
     for chunk in entries.chunks(10_000) {
         db.insert_files(chunk)?;
@@ -139,27 +192,7 @@ pub fn run_incremental_crawl(db: &Database, root: &Path, config: &Config) -> Res
         dirs_skipped
     );
 
-    // Phase 2: Mark deletions
-    tracing::info!("Phase 2: Marking deleted entries");
-    let deleted_count = db.mark_deleted(scan_id, &root_path)?;
-    tracing::info!("Phase 2 complete: {} entries marked deleted", deleted_count);
-
-    // Phase 3-5: Same as full crawl
-    tracing::info!("Phase 3: Computing directory sizes");
-    let dir_sizes = compute_dir_sizes(&entries, scan_id);
-    db.insert_dir_sizes(&dir_sizes)?;
-    tracing::info!("Phase 3 complete: {} directory sizes computed", dir_sizes.len());
-
-    tracing::info!("Phase 4: Computing extension statistics");
-    db.compute_extension_stats(scan_id)?;
-    tracing::info!("Phase 4 complete");
-
-    tracing::info!("Phase 5: Recording size history");
-    db.record_size_history(scan_id, 10 * 1024 * 1024)?;
-    tracing::info!("Phase 5 complete");
-
-    // Phase 6: Complete scan
-    tracing::info!("Phase 6: Finalizing scan");
+    // Pre-compute totals for progress reporting
     let total_files = entries
         .iter()
         .filter(|e| e.file_type == FileType::File)
@@ -174,6 +207,48 @@ pub fn run_incremental_crawl(db: &Database, root: &Path, config: &Config) -> Res
         .map(|e| e.size_bytes)
         .sum();
 
+    // Helper to report phase progress
+    let report_phase = |phase: &str, phase_number: u8| {
+        let _ = db.update_scan_progress(scan_id, &ScanProgress {
+            phase: phase.to_string(),
+            phase_number,
+            total_phases: 7,
+            files_so_far: total_files,
+            dirs_so_far: total_dirs,
+            bytes_so_far: total_size,
+            bytes_so_far_human: format_size(total_size),
+            current_dir: String::new(),
+            elapsed_secs: start_time.elapsed().as_secs(),
+        });
+    };
+
+    // Phase 2: Mark deletions
+    report_phase("marking_deletions", 2);
+    tracing::info!("Phase 2: Marking deleted entries");
+    let deleted_count = db.mark_deleted(scan_id, &root_path)?;
+    tracing::info!("Phase 2 complete: {} entries marked deleted", deleted_count);
+
+    // Phase 3-5: Same as full crawl
+    report_phase("computing_dir_sizes", 3);
+    tracing::info!("Phase 3: Computing directory sizes");
+    let dir_sizes = compute_dir_sizes(&entries, scan_id);
+    db.insert_dir_sizes(&dir_sizes)?;
+    tracing::info!("Phase 3 complete: {} directory sizes computed", dir_sizes.len());
+
+    report_phase("computing_extension_stats", 4);
+    tracing::info!("Phase 4: Computing extension statistics");
+    db.compute_extension_stats(scan_id)?;
+    tracing::info!("Phase 4 complete");
+
+    report_phase("recording_size_history", 5);
+    tracing::info!("Phase 5: Recording size history");
+    db.record_size_history(scan_id, 10 * 1024 * 1024)?;
+    tracing::info!("Phase 5 complete");
+
+    // Phase 6: Complete scan
+    report_phase("finalizing", 6);
+    tracing::info!("Phase 6: Finalizing scan");
+
     let stats = ScanStats {
         total_files,
         total_dirs,
@@ -185,6 +260,7 @@ pub fn run_incremental_crawl(db: &Database, root: &Path, config: &Config) -> Res
     db.complete_scan(scan_id, &stats)?;
 
     // Phase 7: Compact history
+    report_phase("compacting_history", 7);
     tracing::info!("Phase 7: Compacting history");
     let compaction = db.compact_history(config.database.history_retention_days)?;
     if compaction.weekly_compacted > 0 || compaction.monthly_compacted > 0 {

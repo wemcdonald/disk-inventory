@@ -9,8 +9,17 @@ use std::path::Path;
 /// Uses jwalk for parallel directory traversal and delegates per-entry
 /// metadata collection to [`platform::get_metadata`], which selects the
 /// best syscall strategy for the current OS.
-pub fn walk_directory(root: &Path, scan_id: i64, config: &Config) -> Result<Vec<FileEntry>> {
+pub fn walk_directory(
+    root: &Path,
+    scan_id: i64,
+    config: &Config,
+    progress_callback: Option<&dyn Fn(u64, u64, u64, &str)>,
+) -> Result<Vec<FileEntry>> {
     let mut entries = Vec::new();
+    let mut last_progress = std::time::Instant::now();
+    let mut file_count: u64 = 0;
+    let mut dir_count: u64 = 0;
+    let mut byte_count: u64 = 0;
 
     let walker = jwalk::WalkDir::new(root)
         .skip_hidden(false)
@@ -64,6 +73,23 @@ pub fn walk_directory(root: &Path, scan_id: i64, config: &Config) -> Result<Vec<
             None
         };
 
+        // Track progress
+        if meta.file_type == FileType::File {
+            file_count += 1;
+            byte_count += meta.size_bytes;
+        } else if meta.file_type == FileType::Directory {
+            dir_count += 1;
+        }
+
+        if let Some(cb) = &progress_callback {
+            if file_count % 1000 == 0
+                || last_progress.elapsed() > std::time::Duration::from_secs(2)
+            {
+                cb(file_count, dir_count, byte_count, &path_str);
+                last_progress = std::time::Instant::now();
+            }
+        }
+
         entries.push(FileEntry {
             id: None,
             path: path_str,
@@ -104,10 +130,15 @@ pub fn walk_directory_incremental(
     scan_id: i64,
     config: &Config,
     since_timestamp: i64,
+    progress_callback: Option<&dyn Fn(u64, u64, u64, &str)>,
 ) -> Result<(Vec<FileEntry>, u64, u64)> {
     let mut entries = Vec::new();
     let mut dirs_scanned: u64 = 0;
     let mut dirs_skipped: u64 = 0;
+    let mut file_count: u64 = 0;
+    let mut dir_count: u64 = 0;
+    let mut byte_count: u64 = 0;
+    let last_progress = std::cell::RefCell::new(std::time::Instant::now());
 
     walk_recursive(
         root,
@@ -118,6 +149,11 @@ pub fn walk_directory_incremental(
         &mut dirs_scanned,
         &mut dirs_skipped,
         0,
+        &progress_callback,
+        &mut file_count,
+        &mut dir_count,
+        &mut byte_count,
+        &last_progress,
     )?;
 
     Ok((entries, dirs_scanned, dirs_skipped))
@@ -195,6 +231,11 @@ fn walk_recursive(
     dirs_scanned: &mut u64,
     dirs_skipped: &mut u64,
     depth: u32,
+    progress_callback: &Option<&dyn Fn(u64, u64, u64, &str)>,
+    file_count: &mut u64,
+    dir_count: &mut u64,
+    byte_count: &mut u64,
+    last_progress: &std::cell::RefCell<std::time::Instant>,
 ) -> Result<()> {
     if depth > config.scanner.max_depth {
         return Ok(());
@@ -222,7 +263,18 @@ fn walk_recursive(
 
     // Always record the directory entry itself
     if let Some(dir_entry) = build_file_entry(dir, scan_id) {
+        *dir_count += 1;
         entries.push(dir_entry);
+    }
+
+    // Report progress
+    if let Some(cb) = progress_callback {
+        if *file_count % 1000 == 0
+            || last_progress.borrow().elapsed() > std::time::Duration::from_secs(2)
+        {
+            cb(*file_count, *dir_count, *byte_count, &dir_str);
+            *last_progress.borrow_mut() = std::time::Instant::now();
+        }
     }
 
     let dir_mtime = dir_meta.mtime;
@@ -247,6 +299,11 @@ fn walk_recursive(
                             dirs_scanned,
                             dirs_skipped,
                             depth + 1,
+                            progress_callback,
+                            file_count,
+                            dir_count,
+                            byte_count,
+                            last_progress,
                         )?;
                     }
                 }
@@ -285,10 +342,19 @@ fn walk_recursive(
                         dirs_scanned,
                         dirs_skipped,
                         depth + 1,
+                        progress_callback,
+                        file_count,
+                        dir_count,
+                        byte_count,
+                        last_progress,
                     )?;
                 } else {
                     // Build FileEntry for non-directory entries
                     if let Some(file_entry) = build_file_entry(&path, scan_id) {
+                        if file_entry.file_type == FileType::File {
+                            *file_count += 1;
+                            *byte_count += file_entry.size_bytes;
+                        }
                         entries.push(file_entry);
                     }
                 }
@@ -319,7 +385,7 @@ mod tests {
     fn test_walk_directory() {
         let dir = create_test_tree();
         let config = Config::default();
-        let entries = walk_directory(dir.path(), 1, &config).unwrap();
+        let entries = walk_directory(dir.path(), 1, &config, None).unwrap();
 
         // Should find: root dir, big.bin, small.txt, sub/, medium.log, tiny.rs, empty_dir/
         // That's 7 entries (root + 2 files + 2 dirs + 2 files in sub)
@@ -362,7 +428,7 @@ mod tests {
         std::fs::write(dir.path().join(".DS_Store"), "excluded").unwrap();
 
         let config = Config::default();
-        let entries = walk_directory(dir.path(), 1, &config).unwrap();
+        let entries = walk_directory(dir.path(), 1, &config, None).unwrap();
 
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert!(!names.contains(&".DS_Store"), ".DS_Store should be excluded");
@@ -375,7 +441,7 @@ mod tests {
         std::fs::write(dir.path().join("ok.txt"), "fine").unwrap();
 
         let config = Config::default();
-        let result = walk_directory(dir.path(), 1, &config);
+        let result = walk_directory(dir.path(), 1, &config, None);
         assert!(result.is_ok());
     }
 
@@ -386,7 +452,7 @@ mod tests {
         let config = Config::default();
 
         let (entries, dirs_scanned, _dirs_skipped) =
-            walk_directory_incremental(dir.path(), 1, &config, 0).unwrap();
+            walk_directory_incremental(dir.path(), 1, &config, 0, None).unwrap();
 
         // Should find the same entries as a full walk
         assert_eq!(
@@ -413,7 +479,7 @@ mod tests {
         // Use a timestamp far in the future so all directories are "old"
         let future_ts = chrono::Utc::now().timestamp() + 10_000;
         let (entries, dirs_scanned, dirs_skipped) =
-            walk_directory_incremental(dir.path(), 1, &config, future_ts).unwrap();
+            walk_directory_incremental(dir.path(), 1, &config, future_ts, None).unwrap();
 
         // Should only find directory entries (since we always record directory entries)
         // but no file entries (since all dirs are "unchanged")
@@ -440,7 +506,7 @@ mod tests {
 
         let config = Config::default();
         let (entries, _, _) =
-            walk_directory_incremental(dir.path(), 1, &config, 0).unwrap();
+            walk_directory_incremental(dir.path(), 1, &config, 0, None).unwrap();
 
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert!(

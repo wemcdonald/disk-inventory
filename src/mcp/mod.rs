@@ -100,12 +100,12 @@ impl DiskInventoryServer {
         )]))
     }
 
-    #[tool(description = "Check index freshness and scan status.")]
+    #[tool(description = "Check index freshness, active scan progress, and scan status.")]
     async fn scan_status(
         &self,
         Parameters(_params): Parameters<ScanStatusParams>,
     ) -> Result<CallToolResult, McpError> {
-        let result = query::query_scan_status(&self.db)
+        let result = query::query_scan_status_full(&self.db)
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&result).unwrap(),

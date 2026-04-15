@@ -118,6 +118,23 @@ pub struct ScanInfo {
 }
 
 // ---------------------------------------------------------------------------
+// ScanProgress
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ScanProgress {
+    pub phase: String,
+    pub phase_number: u8,
+    pub total_phases: u8,
+    pub files_so_far: u64,
+    pub dirs_so_far: u64,
+    pub bytes_so_far: u64,
+    pub bytes_so_far_human: String,
+    pub current_dir: String,
+    pub elapsed_secs: u64,
+}
+
+// ---------------------------------------------------------------------------
 // SizeHistoryEntry
 // ---------------------------------------------------------------------------
 

@@ -208,22 +208,48 @@ pub fn show_status(config: &Config) -> Result<()> {
         return Ok(());
     }
     let db = Database::open(&db_path)?;
+
+    // Check for active scan
+    if let Some((scan, progress)) = db.active_scan()? {
+        println!("Daemon: scanning");
+        if let Some(p) = progress {
+            println!(
+                "Current scan: {} (Phase {}/{})",
+                p.phase, p.phase_number, p.total_phases
+            );
+            println!(
+                "  Progress: {} files, {} dirs, {}",
+                p.files_so_far, p.dirs_so_far, p.bytes_so_far_human
+            );
+            if !p.current_dir.is_empty() {
+                println!("  Scanning: {}", p.current_dir);
+            }
+            println!("  Elapsed: {}s", p.elapsed_secs);
+        }
+        println!("  Root: {}", scan.root_path);
+        println!();
+    }
+
+    // Show last completed scan
     match db.latest_scan()? {
         Some(scan) => {
-            println!("Database: {}", db_path.display());
-            println!("Last scan: {} ({})",
+            println!("Last completed scan:");
+            println!(
+                "  Date: {}",
                 chrono::DateTime::from_timestamp(scan.started_at, 0)
                     .map(|d| d.format("%Y-%m-%d %H:%M:%S").to_string())
-                    .unwrap_or_else(|| "unknown".to_string()),
-                scan.status.as_str());
-            println!("Root: {}", scan.root_path);
-            println!("Files: {}", scan.total_files);
-            println!("Dirs: {}", scan.total_dirs);
-            println!("Total size: {}", format_size(scan.total_size));
+                    .unwrap_or_else(|| "unknown".into())
+            );
+            println!("  Root: {}", scan.root_path);
+            println!("  Files: {}", scan.total_files);
+            println!("  Dirs: {}", scan.total_dirs);
+            println!("  Total size: {}", format_size(scan.total_size));
         }
         None => {
-            println!("Database exists but no scans have been run yet.");
-            println!("Run `disk-inventory daemon run` to scan.");
+            if db.active_scan()?.is_none() {
+                println!("No scans have been run yet.");
+                println!("Run `disk-inventory daemon run` to scan.");
+            }
         }
     }
     Ok(())

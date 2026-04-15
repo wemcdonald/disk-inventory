@@ -22,7 +22,25 @@ fn open_db() -> Result<Database> {
             db_path.display()
         );
     }
-    Database::open(db_path)
+    let db = Database::open(&db_path)?;
+
+    // Check if there's a completed scan
+    if db.latest_scan()?.is_none() {
+        // No completed scan — check if one is running
+        if let Some((_, Some(progress))) = db.active_scan()? {
+            anyhow::bail!(
+                "Scan in progress: {} files / {} scanned so far (Phase {}/{}: {}).\n\
+                 No completed data yet. Run `disk-inventory daemon status` for progress.",
+                progress.files_so_far,
+                progress.bytes_so_far_human,
+                progress.phase_number,
+                progress.total_phases,
+                progress.phase,
+            );
+        }
+    }
+
+    Ok(db)
 }
 
 pub fn run_usage(path: Option<String>, depth: u32, format: &OutputFormat) -> Result<()> {

@@ -91,23 +91,23 @@ pub fn create_schema(conn: &Connection) -> anyhow::Result<()> {
             PRIMARY KEY (extension, scan_id)
         );
 
-        -- Full-text search on file names and paths
+        -- Full-text search on file names only (not paths — saves ~1.5 GB on large indexes)
         CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(
-            name, path,
+            name,
             content=files, content_rowid=id,
             tokenize='unicode61 remove_diacritics 2'
         );
 
         -- FTS sync triggers
         CREATE TRIGGER IF NOT EXISTS files_ai AFTER INSERT ON files BEGIN
-            INSERT INTO files_fts(rowid, name, path) VALUES (new.id, new.name, new.path);
+            INSERT INTO files_fts(rowid, name) VALUES (new.id, new.name);
         END;
         CREATE TRIGGER IF NOT EXISTS files_ad AFTER DELETE ON files BEGIN
-            INSERT INTO files_fts(files_fts, rowid, name, path) VALUES('delete', old.id, old.name, old.path);
+            INSERT INTO files_fts(files_fts, rowid, name) VALUES('delete', old.id, old.name);
         END;
         CREATE TRIGGER IF NOT EXISTS files_au AFTER UPDATE ON files BEGIN
-            INSERT INTO files_fts(files_fts, rowid, name, path) VALUES('delete', old.id, old.name, old.path);
-            INSERT INTO files_fts(rowid, name, path) VALUES (new.id, new.name, new.path);
+            INSERT INTO files_fts(files_fts, rowid, name) VALUES('delete', old.id, old.name);
+            INSERT INTO files_fts(rowid, name) VALUES (new.id, new.name);
         END;
 
         -- Indexes for common query patterns
@@ -116,11 +116,8 @@ pub fn create_schema(conn: &Connection) -> anyhow::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_files_ext_size ON files(extension, size_bytes DESC) WHERE file_type = 0;
         CREATE INDEX IF NOT EXISTS idx_files_mtime ON files(mtime DESC);
         CREATE INDEX IF NOT EXISTS idx_files_atime ON files(atime ASC) WHERE file_type = 0;
-        CREATE INDEX IF NOT EXISTS idx_files_scan ON files(scan_id);
         CREATE INDEX IF NOT EXISTS idx_files_deleted ON files(is_deleted, scan_id) WHERE is_deleted = 1;
-        CREATE INDEX IF NOT EXISTS idx_files_depth ON files(depth, size_bytes DESC);
         CREATE INDEX IF NOT EXISTS idx_files_size_exact ON files(size_bytes, inode) WHERE file_type = 0 AND size_bytes > 0;
-        CREATE INDEX IF NOT EXISTS idx_files_inode ON files(device_id, inode) WHERE hardlink_count > 1;
         CREATE INDEX IF NOT EXISTS idx_dir_sizes_size ON dir_sizes(total_size DESC);
         CREATE INDEX IF NOT EXISTS idx_history_time ON size_history(recorded_at DESC);
         CREATE INDEX IF NOT EXISTS idx_history_delta ON size_history(delta_size DESC) WHERE delta_size != 0;
@@ -131,6 +128,52 @@ pub fn create_schema(conn: &Connection) -> anyhow::Result<()> {
     // ALTER TABLE … ADD COLUMN is a no-op if the column already exists on
     // newer SQLite versions, but older ones may error — so we ignore errors.
     let _ = conn.execute_batch("ALTER TABLE scans ADD COLUMN progress TEXT;");
+
+    // Migration: if FTS5 table has a 'path' column (old schema), rebuild it with name-only.
+    // Drop old triggers, old FTS table, then the CREATE VIRTUAL TABLE above will recreate.
+    let has_path_in_fts: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('files_fts') WHERE name = 'path'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+        > 0;
+    if has_path_in_fts {
+        let _ = conn.execute_batch(
+            "DROP TRIGGER IF EXISTS files_ai;
+             DROP TRIGGER IF EXISTS files_ad;
+             DROP TRIGGER IF EXISTS files_au;
+             DROP TABLE IF EXISTS files_fts;",
+        );
+        // Recreate with name-only (re-run the schema creation for just FTS)
+        let _ = conn.execute_batch(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(
+                name,
+                content=files, content_rowid=id,
+                tokenize='unicode61 remove_diacritics 2'
+            );
+            CREATE TRIGGER IF NOT EXISTS files_ai AFTER INSERT ON files BEGIN
+                INSERT INTO files_fts(rowid, name) VALUES (new.id, new.name);
+            END;
+            CREATE TRIGGER IF NOT EXISTS files_ad AFTER DELETE ON files BEGIN
+                INSERT INTO files_fts(files_fts, rowid, name) VALUES('delete', old.id, old.name);
+            END;
+            CREATE TRIGGER IF NOT EXISTS files_au AFTER UPDATE ON files BEGIN
+                INSERT INTO files_fts(files_fts, rowid, name) VALUES('delete', old.id, old.name);
+                INSERT INTO files_fts(rowid, name) VALUES (new.id, new.name);
+            END;
+            -- Rebuild FTS index from existing data
+            INSERT INTO files_fts(files_fts) VALUES('rebuild');",
+        );
+    }
+
+    // Migration: drop indexes that aren't worth the space
+    let _ = conn.execute_batch(
+        "DROP INDEX IF EXISTS idx_files_scan;
+         DROP INDEX IF EXISTS idx_files_depth;
+         DROP INDEX IF EXISTS idx_files_inode;",
+    );
 
     Ok(())
 }

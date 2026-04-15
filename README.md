@@ -2,7 +2,7 @@
 
 Fast, AI-friendly disk usage analysis. Crawls your filesystem into a SQLite index, then answers questions about where your space is going — via CLI, MCP (for Claude/AI assistants), or JSON.
 
-Think ncdu meets Disk Inventory X, but queryable by an AI.
+Think ncdu meets Disk Inventory X, but queryable by an AI:
 
 
 ```

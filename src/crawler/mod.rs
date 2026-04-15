@@ -33,13 +33,33 @@ pub fn run_crawl(db: &Database, root: &Path, config: &Config) -> Result<ScanInfo
     };
     let entries = walker::walk_directory(root, scan_id, config, Some(&progress_cb))?;
 
+    tracing::info!("Walking complete: {} entries found. Inserting into database...", entries.len());
+
     db.enable_bulk_mode()?;
+    let total_entries = entries.len();
+    let mut inserted: usize = 0;
     for chunk in entries.chunks(10_000) {
         db.insert_files(chunk)?;
+        inserted += chunk.len();
+        // Report insert progress every 50K entries
+        if inserted % 50_000 < 10_000 {
+            let _ = db.update_scan_progress(scan_id, &ScanProgress {
+                phase: "inserting".to_string(),
+                phase_number: 1,
+                total_phases: 7,
+                files_so_far: inserted as u64,
+                dirs_so_far: total_entries as u64, // reuse as "total" for percentage
+                bytes_so_far: 0,
+                bytes_so_far_human: format!("{}/{} entries", inserted, total_entries),
+                current_dir: String::new(),
+                elapsed_secs: start_time.elapsed().as_secs(),
+            });
+            tracing::info!("Inserting: {}/{} entries", inserted, total_entries);
+        }
     }
     db.disable_bulk_mode()?;
 
-    tracing::info!("Phase 1 complete: {} entries found", entries.len());
+    tracing::info!("Phase 1 complete: {} entries inserted", total_entries);
 
     // Pre-compute totals for progress reporting
     let total_files = entries
@@ -180,16 +200,31 @@ pub fn run_incremental_crawl(db: &Database, root: &Path, config: &Config) -> Res
     let (entries, dirs_scanned, dirs_skipped) =
         walker::walk_directory_incremental(root, scan_id, config, prev_scan_time, Some(&progress_cb))?;
 
+    let total_entries = entries.len();
+    let mut inserted: usize = 0;
     for chunk in entries.chunks(10_000) {
         db.insert_files(chunk)?;
+        inserted += chunk.len();
+        if inserted % 50_000 < 10_000 {
+            let _ = db.update_scan_progress(scan_id, &ScanProgress {
+                phase: "inserting".to_string(),
+                phase_number: 1,
+                total_phases: 7,
+                files_so_far: inserted as u64,
+                dirs_so_far: total_entries as u64,
+                bytes_so_far: 0,
+                bytes_so_far_human: format!("{}/{} entries", inserted, total_entries),
+                current_dir: String::new(),
+                elapsed_secs: start_time.elapsed().as_secs(),
+            });
+            tracing::info!("Inserting: {}/{} entries", inserted, total_entries);
+        }
     }
     db.disable_bulk_mode()?;
 
     tracing::info!(
-        "Incremental walk: {} entries found, {} dirs scanned, {} dirs skipped",
-        entries.len(),
-        dirs_scanned,
-        dirs_skipped
+        "Incremental walk: {} entries found ({} dirs scanned, {} skipped), {} inserted",
+        total_entries, dirs_scanned, dirs_skipped, inserted
     );
 
     // Pre-compute totals for progress reporting

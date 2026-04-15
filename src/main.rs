@@ -116,13 +116,22 @@ enum Commands {
 #[derive(Subcommand)]
 enum DaemonAction {
     /// Run daemon in foreground
-    Run,
+    Run {
+        /// Run a single crawl and exit (don't start periodic daemon)
+        #[arg(long)]
+        once: bool,
+    },
     /// Install as system service
     Install,
     /// Remove system service
     Uninstall,
     /// Show daemon status
     Status,
+    /// Trigger an immediate rescan via IPC
+    Rescan {
+        /// Optional path to rescan (defaults to all watch paths)
+        path: Option<String>,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -161,21 +170,48 @@ fn main() -> anyhow::Result<()> {
         Commands::Duplicates { path, min_size, limit, format } =>
             cli::run_duplicates(path, min_size, limit, &format),
         Commands::Daemon { action } => match action {
-            DaemonAction::Run => {
+            DaemonAction::Run { once } => {
                 tracing_subscriber::fmt()
                     .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
                     .with_writer(std::io::stderr)
                     .init();
                 let config = disk_inventory::config::Config::load()?;
-                disk_inventory::daemon::run_once(&config)?;
+                if once {
+                    disk_inventory::daemon::run_once(&config)?;
+                } else {
+                    let rt = tokio::runtime::Runtime::new()?;
+                    rt.block_on(disk_inventory::daemon::run_daemon(config))?;
+                }
                 Ok(())
             }
-            DaemonAction::Install => todo!("daemon install"),
-            DaemonAction::Uninstall => todo!("daemon uninstall"),
+            DaemonAction::Install => {
+                disk_inventory::daemon::service::install()?;
+                Ok(())
+            }
+            DaemonAction::Uninstall => {
+                disk_inventory::daemon::service::uninstall()?;
+                Ok(())
+            }
             DaemonAction::Status => {
                 let config = disk_inventory::config::Config::load()?;
                 disk_inventory::daemon::show_status(&config)?;
                 Ok(())
+            }
+            DaemonAction::Rescan { path } => {
+                let cmd = match &path {
+                    Some(p) => format!("rescan {}", p),
+                    None => "rescan".to_string(),
+                };
+                match disk_inventory::daemon::send_ipc_command(&cmd) {
+                    Ok(response) => {
+                        println!("{}", response.trim());
+                        Ok(())
+                    }
+                    Err(e) => {
+                        eprintln!("Error: {}", e);
+                        std::process::exit(1);
+                    }
+                }
             }
         },
         Commands::Mcp => {

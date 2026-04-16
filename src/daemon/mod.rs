@@ -227,17 +227,23 @@ async fn handle_ipc_connection(
                 config.resolved_watch_paths()
             };
 
-            for watch_path in &paths {
-                if watch_path.exists() {
-                    match crawler::run_incremental_crawl(db, watch_path, config) {
-                        Ok(scan) => {
-                            tracing::info!("Rescan complete: {} files", scan.total_files)
+            // Spawn the crawl in the background so the IPC client gets
+            // an immediate response instead of blocking for the full scan.
+            let db = db.clone();
+            let config = config.clone();
+            tokio::spawn(async move {
+                for watch_path in &paths {
+                    if watch_path.exists() {
+                        match crawler::run_incremental_crawl(&db, watch_path, &config) {
+                            Ok(scan) => {
+                                tracing::info!("Rescan complete: {} files", scan.total_files)
+                            }
+                            Err(e) => tracing::error!("Rescan failed: {}", e),
                         }
-                        Err(e) => tracing::error!("Rescan failed: {}", e),
                     }
                 }
-            }
-            r#"{"status":"rescan_complete"}"#.to_string()
+            });
+            r#"{"status":"rescan_started"}"#.to_string()
         }
         _ => r#"{"error":"unknown command. Use: status, rescan [path]"}"#.to_string(),
     };

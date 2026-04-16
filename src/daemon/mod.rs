@@ -75,6 +75,36 @@ pub async fn run_daemon(config: Config) -> Result<()> {
         }
     }
 
+    // Optional filesystem watcher
+    let watcher = if config.daemon.enable_watcher {
+        match crate::watcher::DebouncedWatcher::new(
+            &config.resolved_watch_paths(),
+            config.daemon.watcher_debounce_secs,
+        ) {
+            Ok(w) => {
+                tracing::info!("Filesystem watcher enabled ({}s debounce)",
+                    config.daemon.watcher_debounce_secs);
+                Some(std::sync::Mutex::new(w))
+            }
+            Err(e) => {
+                tracing::warn!("Failed to start filesystem watcher: {}", e);
+                None
+            }
+        }
+    } else {
+        tracing::info!("Filesystem watcher disabled");
+        None
+    };
+
+    // Watcher poll timer — check for events every 2s
+    let mut watcher_timer = tokio::time::interval(std::time::Duration::from_secs(2));
+    watcher_timer.tick().await;
+
+    // Dir sizes recompute timer — 30s after watcher updates
+    let mut dir_sizes_timer = tokio::time::interval(std::time::Duration::from_secs(30));
+    dir_sizes_timer.tick().await;
+    let mut dirs_dirty = false;
+
     // Set up IPC socket
     let socket_path = crate::config::config_dir().join("daemon.sock");
     // Remove stale socket if it exists
@@ -119,6 +149,42 @@ pub async fn run_daemon(config: Config) -> Result<()> {
                         });
                     }
                     Err(e) => tracing::error!("IPC accept error: {}", e),
+                }
+            }
+
+            // Filesystem watcher poll
+            _ = watcher_timer.tick() => {
+                if let Some(ref watcher_mutex) = watcher {
+                    let changed = {
+                        let mut w = watcher_mutex.lock().unwrap();
+                        w.poll()
+                    };
+                    if let Some(dirs) = changed {
+                        if !dirs.is_empty() {
+                            tracing::debug!("Watcher: {} directories changed", dirs.len());
+                            let dir_vec: Vec<_> = dirs.into_iter().collect();
+                            match crawler::rescan_directories(&db, &dir_vec, &config) {
+                                Ok(n) => {
+                                    if n > 0 {
+                                        tracing::info!("Watcher rescan: {} entries updated", n);
+                                        dirs_dirty = true;
+                                    }
+                                }
+                                Err(e) => tracing::error!("Watcher rescan error: {}", e),
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Periodic dir_sizes recompute after watcher updates
+            _ = dir_sizes_timer.tick() => {
+                if dirs_dirty {
+                    tracing::info!("Recomputing dir_sizes after watcher updates");
+                    if let Err(e) = db.recompute_dir_sizes() {
+                        tracing::error!("dir_sizes recompute error: {}", e);
+                    }
+                    dirs_dirty = false;
                 }
             }
 

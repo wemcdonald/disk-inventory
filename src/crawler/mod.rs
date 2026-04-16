@@ -7,7 +7,7 @@ use crate::db::Database;
 use crate::models::*;
 use anyhow::Result;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Run a full crawl: walk filesystem, insert entries, compute aggregates.
 pub fn run_crawl(db: &Database, root: &Path, config: &Config) -> Result<ScanInfo> {
@@ -327,6 +327,105 @@ pub fn run_incremental_crawl(db: &Database, root: &Path, config: &Config) -> Res
     Ok(scan_info)
 }
 
+/// Re-scan specific directories flagged by the watcher.
+/// Re-stats direct contents and updates the DB.
+/// Does NOT recompute dir_sizes (caller does that periodically).
+pub fn rescan_directories(
+    db: &Database,
+    dirs: &[PathBuf],
+    config: &Config,
+) -> Result<u64> {
+    let scan = db.latest_scan()?;
+    let scan_id = match scan {
+        Some(s) => s.id,
+        None => return Ok(0),
+    };
+
+    let mut updated: u64 = 0;
+
+    for dir in dirs {
+        if !dir.exists() || !dir.is_dir() {
+            continue;
+        }
+        let dir_str = dir.to_string_lossy().to_string();
+
+        let read_dir = match std::fs::read_dir(dir) {
+            Ok(rd) => rd,
+            Err(e) => {
+                tracing::warn!("watcher rescan: cannot read {}: {}", dir_str, e);
+                continue;
+            }
+        };
+
+        let mut entries = Vec::new();
+        for result in read_dir {
+            let dir_entry = match result {
+                Ok(de) => de,
+                Err(_) => continue,
+            };
+            let name = dir_entry.file_name().to_string_lossy().to_string();
+            if config.is_excluded(&name) {
+                continue;
+            }
+
+            let path = dir_entry.path();
+            let meta = match platform::get_metadata(&path) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+
+            let path_str = path.to_string_lossy().to_string();
+            let symlink_target = if meta.file_type == FileType::Symlink {
+                std::fs::read_link(&path)
+                    .ok()
+                    .map(|t| t.to_string_lossy().to_string())
+            } else {
+                None
+            };
+
+            entries.push(FileEntry {
+                id: None,
+                path: path_str.clone(),
+                parent_path: dir_str.clone(),
+                name,
+                extension: if meta.file_type == FileType::File {
+                    crate::models::extract_extension(
+                        &dir_entry.file_name().to_string_lossy(),
+                    )
+                } else {
+                    None
+                },
+                file_type: meta.file_type,
+                inode: meta.inode,
+                device_id: meta.device_id,
+                hardlink_count: meta.hardlink_count,
+                symlink_target,
+                size_bytes: meta.size_bytes,
+                blocks: meta.blocks,
+                mtime: meta.mtime,
+                ctime: meta.ctime,
+                atime: meta.atime,
+                birth_time: meta.birth_time,
+                uid: meta.uid,
+                gid: meta.gid,
+                mode: meta.mode,
+                scan_id,
+                first_seen_scan: scan_id,
+                is_deleted: false,
+                depth: crate::models::path_depth(&path_str),
+                path_components: crate::models::path_component_count(&path_str),
+            });
+        }
+
+        if !entries.is_empty() {
+            db.insert_files(&entries)?;
+            updated += entries.len() as u64;
+        }
+    }
+
+    Ok(updated)
+}
+
 /// Compute directory sizes via bottom-up aggregation.
 ///
 /// For each directory, total_size includes all files recursively beneath it,
@@ -471,6 +570,34 @@ mod tests {
         std::fs::write(dir.path().join("sub").join("tiny.rs"), "fn main(){}").unwrap();
         std::fs::create_dir(dir.path().join("empty_dir")).unwrap();
         dir
+    }
+
+    #[test]
+    fn test_rescan_directories() {
+        let dir = create_test_tree();
+        let db = Database::open_in_memory().unwrap();
+        let config = Config::default();
+
+        // Initial crawl
+        run_crawl(&db, dir.path(), &config).unwrap();
+
+        // Add a new file
+        std::fs::write(dir.path().join("added.txt"), "new file").unwrap();
+
+        // Rescan just the root directory
+        let updated = rescan_directories(
+            &db,
+            &[dir.path().to_path_buf()],
+            &config,
+        )
+        .unwrap();
+
+        assert!(updated > 0, "should have updated entries");
+
+        // Verify the new file is in the DB
+        let files = db.largest_files(None, 100).unwrap();
+        let names: Vec<&str> = files.iter().map(|f| f.name.as_str()).collect();
+        assert!(names.contains(&"added.txt"), "new file should be in DB");
     }
 
     #[test]

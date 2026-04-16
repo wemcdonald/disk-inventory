@@ -353,6 +353,30 @@ impl Database {
         Ok(())
     }
 
+    /// Recompute all dir_sizes from the current files table.
+    /// Used after watcher updates to refresh aggregates.
+    pub fn recompute_dir_sizes(&self) -> Result<()> {
+        let conn = self.conn();
+        conn.execute("DELETE FROM dir_sizes", [])?;
+        conn.execute_batch(
+            "INSERT INTO dir_sizes (path, total_size, file_count, dir_count, max_depth, largest_file, scan_id)
+             SELECT
+                 d.path,
+                 COALESCE(SUM(CASE WHEN f.file_type = 0 THEN f.size_bytes ELSE 0 END), 0),
+                 COUNT(CASE WHEN f.file_type = 0 THEN 1 END),
+                 COUNT(CASE WHEN f.file_type = 1 THEN 1 END),
+                 0,
+                 COALESCE(MAX(CASE WHEN f.file_type = 0 THEN f.size_bytes END), 0),
+                 d.scan_id
+             FROM files d
+             JOIN files f ON f.path >= d.path || '/' AND f.path < d.path || '0'
+                 AND f.is_deleted = 0
+             WHERE d.file_type = 1 AND d.is_deleted = 0
+             GROUP BY d.path, d.scan_id;"
+        )?;
+        Ok(())
+    }
+
     /// Get the recursive size of a specific directory. O(1) lookup.
     pub fn get_dir_size(&self, path: &str) -> Result<Option<DirSize>> {
         let conn = self.conn();

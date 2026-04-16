@@ -60,6 +60,8 @@ pub struct DaemonConfig {
     pub scan_interval_secs: u64,
     pub snapshot_interval_secs: u64,
     pub watch_paths: Vec<String>,
+    pub enable_watcher: bool,
+    pub watcher_debounce_secs: u64,
 }
 
 impl Default for DaemonConfig {
@@ -68,6 +70,8 @@ impl Default for DaemonConfig {
             scan_interval_secs: 21600,
             snapshot_interval_secs: 86400,
             watch_paths: vec!["~".to_string()],
+            enable_watcher: true,
+            watcher_debounce_secs: 5,
         }
     }
 }

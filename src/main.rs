@@ -120,6 +120,9 @@ enum DaemonAction {
         /// Run a single crawl and exit (don't start periodic daemon)
         #[arg(long)]
         once: bool,
+        /// Skip the Full Disk Access check prompt on macOS
+        #[arg(long)]
+        no_fda_check: bool,
     },
     /// Install as system service
     Install,
@@ -189,7 +192,7 @@ fn main() -> anyhow::Result<()> {
         Commands::Duplicates { path, min_size, limit, format } =>
             cli::run_duplicates(path, min_size, limit, &format),
         Commands::Daemon { action } => match action {
-            DaemonAction::Run { once } => {
+            DaemonAction::Run { once, no_fda_check } => {
                 tracing_subscriber::fmt()
                     .with_env_filter(
                         tracing_subscriber::EnvFilter::try_from_default_env()
@@ -199,10 +202,10 @@ fn main() -> anyhow::Result<()> {
                     .init();
                 let config = disk_inventory::config::Config::load()?;
                 if once {
-                    disk_inventory::daemon::run_once(&config)?;
+                    disk_inventory::daemon::run_once(&config, no_fda_check)?;
                 } else {
                     let rt = tokio::runtime::Runtime::new()?;
-                    rt.block_on(disk_inventory::daemon::run_daemon(config))?;
+                    rt.block_on(disk_inventory::daemon::run_daemon(config, no_fda_check))?;
                 }
                 Ok(())
             }

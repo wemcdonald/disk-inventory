@@ -10,9 +10,83 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 
+#[cfg(target_os = "macos")]
+fn check_full_disk_access(db: &Database) -> Result<()> {
+    use std::io::{self, Write};
+
+    // Only prompt on first ever scan
+    if db.latest_scan()?.is_some() {
+        return Ok(());
+    }
+
+    // Only prompt in interactive mode
+    let is_tty = unsafe { libc::isatty(libc::STDIN_FILENO) != 0 };
+    if !is_tty {
+        return Ok(());
+    }
+
+    // Detect terminal app name
+    let terminal = std::env::var("TERM_PROGRAM")
+        .ok()
+        .map(|tp| match tp.as_str() {
+            "iTerm.app" => "iTerm2".to_string(),
+            "Apple_Terminal" => "Terminal".to_string(),
+            "vscode" => "Visual Studio Code".to_string(),
+            "WarpTerminal" => "Warp".to_string(),
+            other => other.to_string(),
+        })
+        .unwrap_or_else(|| "your terminal app".to_string());
+
+    eprintln!();
+    eprintln!("  Tip: For complete results, grant Full Disk Access.");
+    eprintln!();
+    eprintln!("  This lets disk-inventory index everything in one pass, without");
+    eprintln!("  individual permission prompts for Mail, Safari, Messages, etc.");
+    eprintln!("  Without it, scans still work but may skip protected directories.");
+    eprintln!();
+    eprintln!("  System Settings → Privacy & Security → Full Disk Access");
+    eprintln!("  → Enable access for \"{}\"", terminal);
+    eprintln!();
+    eprint!("  [o] Open Settings   [enter] Continue   [q] Quit: ");
+    io::stderr().flush()?;
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    let choice = input.trim().to_lowercase();
+
+    match choice.as_str() {
+        "o" | "open" => {
+            let _ = std::process::Command::new("open")
+                .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")
+                .spawn();
+            eprintln!();
+            eprintln!("  Settings opened. Enable Full Disk Access, then press Enter to continue...");
+            let mut discard = String::new();
+            io::stdin().read_line(&mut discard)?;
+        }
+        "q" | "quit" => {
+            std::process::exit(0);
+        }
+        _ => {
+            // Enter / anything else — continue
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn check_full_disk_access(_db: &Database) -> Result<()> {
+    Ok(())
+}
+
 /// Run a single crawl of all configured watch paths and exit.
-pub fn run_once(config: &Config) -> Result<()> {
+pub fn run_once(config: &Config, no_fda_check: bool) -> Result<()> {
     let db = Database::open(config.db_path())?;
+
+    if !no_fda_check {
+        check_full_disk_access(&db)?;
+    }
 
     for watch_path in config.resolved_watch_paths() {
         if !watch_path.exists() {
@@ -25,6 +99,13 @@ pub fn run_once(config: &Config) -> Result<()> {
             "Crawl complete: {} files, {} dirs, {}",
             scan.total_files, scan.total_dirs, format_size(scan.total_size),
         );
+        if scan.permission_errors > 0 {
+            tracing::warn!(
+                "{} directories were inaccessible (permission denied). \
+                 Grant Full Disk Access for complete results.",
+                scan.permission_errors,
+            );
+        }
     }
 
     Ok(())
@@ -56,8 +137,12 @@ pub fn run_incremental(config: &Config) -> Result<()> {
 }
 
 /// Run the daemon: initial crawl, then periodic rescans + IPC.
-pub async fn run_daemon(config: Config) -> Result<()> {
+pub async fn run_daemon(config: Config, no_fda_check: bool) -> Result<()> {
     let db = Database::open(config.db_path())?;
+
+    if !no_fda_check {
+        check_full_disk_access(&db)?;
+    }
 
     // Prevent multiple daemon instances
     use std::fs::OpenOptions;
@@ -94,11 +179,20 @@ pub async fn run_daemon(config: Config) -> Result<()> {
         }
         tracing::info!("Initial crawl of {}", watch_path.display());
         match crawler::run_crawl(&db, &watch_path, &config) {
-            Ok(scan) => tracing::info!(
-                "Initial crawl complete: {} files, {}",
-                scan.total_files,
-                format_size(scan.total_size)
-            ),
+            Ok(scan) => {
+                tracing::info!(
+                    "Initial crawl complete: {} files, {}",
+                    scan.total_files,
+                    format_size(scan.total_size)
+                );
+                if scan.permission_errors > 0 {
+                    tracing::warn!(
+                        "{} directories were inaccessible (permission denied). \
+                         Grant Full Disk Access for complete results.",
+                        scan.permission_errors,
+                    );
+                }
+            }
             Err(e) => tracing::error!("Initial crawl failed: {}", e),
         }
     }

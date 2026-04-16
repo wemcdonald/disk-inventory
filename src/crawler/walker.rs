@@ -29,12 +29,13 @@ pub fn walk_directory(
     scan_id: i64,
     config: &Config,
     progress_callback: Option<&dyn Fn(u64, u64, u64, &str)>,
-) -> Result<Vec<FileEntry>> {
+) -> Result<(Vec<FileEntry>, u64)> {
     let mut entries = Vec::new();
     let mut last_progress = std::time::Instant::now();
     let mut file_count: u64 = 0;
     let mut dir_count: u64 = 0;
     let mut byte_count: u64 = 0;
+    let mut permission_errors: u64 = 0;
 
     // Get root device ID for cross-filesystem detection
     let root_device_id = if !config.scanner.cross_filesystems {
@@ -54,6 +55,10 @@ pub fn walk_directory(
             Ok(entry) => entry,
             Err(e) => {
                 if is_harmless_io_error(&e) {
+                    let msg = e.to_string();
+                    if msg.contains("Permission denied") || msg.contains("Operation not permitted") {
+                        permission_errors += 1;
+                    }
                     tracing::debug!("walk error (skipped): {}", e);
                 } else {
                     tracing::warn!("walk error: {}", e);
@@ -77,6 +82,10 @@ pub fn walk_directory(
             Ok(m) => m,
             Err(e) => {
                 if is_harmless_io_error(&e) {
+                    let msg = e.to_string();
+                    if msg.contains("Permission denied") || msg.contains("Operation not permitted") {
+                        permission_errors += 1;
+                    }
                     tracing::debug!("metadata error (skipped): {}: {}", path_str, e);
                 } else {
                     tracing::warn!("metadata error for {}: {}", path_str, e);
@@ -157,7 +166,7 @@ pub fn walk_directory(
         });
     }
 
-    Ok(entries)
+    Ok((entries, permission_errors))
 }
 
 /// Walk a directory tree incrementally — only descend into directories
@@ -170,13 +179,14 @@ pub fn walk_directory_incremental(
     config: &Config,
     since_timestamp: i64,
     progress_callback: Option<&dyn Fn(u64, u64, u64, &str)>,
-) -> Result<(Vec<FileEntry>, u64, u64)> {
+) -> Result<(Vec<FileEntry>, u64, u64, u64)> {
     let mut entries = Vec::new();
     let mut dirs_scanned: u64 = 0;
     let mut dirs_skipped: u64 = 0;
     let mut file_count: u64 = 0;
     let mut dir_count: u64 = 0;
     let mut byte_count: u64 = 0;
+    let mut permission_errors: u64 = 0;
     let last_progress = std::cell::RefCell::new(std::time::Instant::now());
 
     walk_recursive(
@@ -193,9 +203,10 @@ pub fn walk_directory_incremental(
         &mut dir_count,
         &mut byte_count,
         &last_progress,
+        &mut permission_errors,
     )?;
 
-    Ok((entries, dirs_scanned, dirs_skipped))
+    Ok((entries, dirs_scanned, dirs_skipped, permission_errors))
 }
 
 fn build_file_entry(
@@ -279,6 +290,7 @@ fn walk_recursive(
     dir_count: &mut u64,
     byte_count: &mut u64,
     last_progress: &std::cell::RefCell<std::time::Instant>,
+    permission_errors: &mut u64,
 ) -> Result<()> {
     if depth > config.scanner.max_depth {
         return Ok(());
@@ -289,6 +301,10 @@ fn walk_recursive(
         Ok(m) => m,
         Err(e) => {
             if is_harmless_io_error(&e) {
+                let msg = e.to_string();
+                if msg.contains("Permission denied") || msg.contains("Operation not permitted") {
+                    *permission_errors += 1;
+                }
                 tracing::debug!("cannot stat directory (skipped): {}: {}", dir.display(), e);
             } else {
                 tracing::warn!("Cannot stat directory {}: {}", dir.display(), e);
@@ -351,6 +367,7 @@ fn walk_recursive(
                             dir_count,
                             byte_count,
                             last_progress,
+                            permission_errors,
                         )?;
                     }
                 }
@@ -367,6 +384,10 @@ fn walk_recursive(
                     Ok(e) => e,
                     Err(e) => {
                         if is_harmless_io_error(&e) {
+                            let msg = e.to_string();
+                            if msg.contains("Permission denied") || msg.contains("Operation not permitted") {
+                                *permission_errors += 1;
+                            }
                             tracing::debug!("readdir error (skipped): {}: {}", dir.display(), e);
                         } else {
                             tracing::warn!("readdir error in {}: {}", dir.display(), e);
@@ -398,6 +419,7 @@ fn walk_recursive(
                         dir_count,
                         byte_count,
                         last_progress,
+                        permission_errors,
                     )?;
                 } else {
                     // Build FileEntry for non-directory entries
@@ -436,7 +458,7 @@ mod tests {
     fn test_walk_directory() {
         let dir = create_test_tree();
         let config = Config::default();
-        let entries = walk_directory(dir.path(), 1, &config, None).unwrap();
+        let (entries, _permission_errors) = walk_directory(dir.path(), 1, &config, None).unwrap();
 
         // Should find: root dir, big.bin, small.txt, sub/, medium.log, tiny.rs, empty_dir/
         // That's 7 entries (root + 2 files + 2 dirs + 2 files in sub)
@@ -479,7 +501,7 @@ mod tests {
         std::fs::write(dir.path().join(".DS_Store"), "excluded").unwrap();
 
         let config = Config::default();
-        let entries = walk_directory(dir.path(), 1, &config, None).unwrap();
+        let (entries, _permission_errors) = walk_directory(dir.path(), 1, &config, None).unwrap();
 
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert!(!names.contains(&".DS_Store"), ".DS_Store should be excluded");
@@ -502,7 +524,7 @@ mod tests {
         let dir = create_test_tree();
         let config = Config::default();
 
-        let (entries, dirs_scanned, _dirs_skipped) =
+        let (entries, dirs_scanned, _dirs_skipped, _perm_errs) =
             walk_directory_incremental(dir.path(), 1, &config, 0, None).unwrap();
 
         // Should find the same entries as a full walk
@@ -529,7 +551,7 @@ mod tests {
 
         // Use a timestamp far in the future so all directories are "old"
         let future_ts = chrono::Utc::now().timestamp() + 10_000;
-        let (entries, dirs_scanned, dirs_skipped) =
+        let (entries, dirs_scanned, dirs_skipped, _perm_errs) =
             walk_directory_incremental(dir.path(), 1, &config, future_ts, None).unwrap();
 
         // Should only find directory entries (since we always record directory entries)
@@ -556,7 +578,7 @@ mod tests {
         std::fs::write(dir.path().join(".DS_Store"), "excluded").unwrap();
 
         let config = Config::default();
-        let (entries, _, _) =
+        let (entries, _, _, _) =
             walk_directory_incremental(dir.path(), 1, &config, 0, None).unwrap();
 
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();

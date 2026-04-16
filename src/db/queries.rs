@@ -21,6 +21,7 @@ pub struct ScanStats {
     pub files_added: u64,
     pub files_modified: u64,
     pub files_deleted: u64,
+    pub permission_errors: u64,
 }
 
 /// Criteria for searching files with flexible filters.
@@ -145,8 +146,9 @@ impl Database {
                 files_added = ?5,
                 files_modified = ?6,
                 files_deleted = ?7,
+                permission_errors = ?8,
                 status = 'completed'
-            WHERE id = ?8",
+            WHERE id = ?9",
             params![
                 now,
                 stats.total_files,
@@ -155,6 +157,7 @@ impl Database {
                 stats.files_added,
                 stats.files_modified,
                 stats.files_deleted,
+                stats.permission_errors,
                 scan_id,
             ],
         )
@@ -167,7 +170,8 @@ impl Database {
         let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT id, root_path, started_at, completed_at, total_files, total_dirs,
-                    total_size, files_added, files_modified, files_deleted, status
+                    total_size, files_added, files_modified, files_deleted, status,
+                    permission_errors
              FROM scans
              WHERE status = 'completed'
              ORDER BY id DESC
@@ -187,6 +191,7 @@ impl Database {
                 files_added: row.get(7)?,
                 files_modified: row.get(8)?,
                 files_deleted: row.get(9)?,
+                permission_errors: row.get::<_, Option<u64>>(11)?.unwrap_or(0),
                 status: ScanStatus::from_str(&status_str).unwrap_or(ScanStatus::Running),
             })
         })?;
@@ -230,7 +235,8 @@ impl Database {
         let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT id, root_path, started_at, completed_at, total_files, total_dirs,
-                    total_size, files_added, files_modified, files_deleted, status, progress
+                    total_size, files_added, files_modified, files_deleted, status, progress,
+                    permission_errors
              FROM scans WHERE status = 'running' ORDER BY id DESC LIMIT 1",
         )?;
         let result = stmt
@@ -248,6 +254,7 @@ impl Database {
                     files_added: row.get(7)?,
                     files_modified: row.get(8)?,
                     files_deleted: row.get(9)?,
+                    permission_errors: row.get::<_, Option<u64>>(12)?.unwrap_or(0),
                     status: ScanStatus::from_str(&status_str).unwrap_or(ScanStatus::Running),
                 };
                 let progress = progress_json.and_then(|j| serde_json::from_str(&j).ok());
@@ -1292,6 +1299,7 @@ mod tests {
             files_added: 90,
             files_modified: 5,
             files_deleted: 3,
+            permission_errors: 0,
         };
         db.complete_scan(scan_id, &stats).expect("complete_scan");
 
@@ -1903,6 +1911,7 @@ mod tests {
             files_added: 100,
             files_modified: 0,
             files_deleted: 0,
+            permission_errors: 0,
         };
         db.complete_scan(scan_id, &stats).unwrap();
 
@@ -1924,6 +1933,7 @@ mod tests {
             files_added: 50,
             files_modified: 0,
             files_deleted: 0,
+            permission_errors: 0,
         };
         db.complete_scan(scan_id_1, &stats).unwrap();
 

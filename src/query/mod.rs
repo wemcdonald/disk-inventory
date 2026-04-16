@@ -20,6 +20,7 @@ pub struct OverviewResult {
     pub dir_count: u64,
     pub children: Vec<ChildSummary>,
     pub last_scan_time: Option<i64>,
+    pub permission_errors: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -39,6 +40,7 @@ pub struct ChildSummary {
 pub struct LargeItemResult {
     pub items: Vec<LargeItem>,
     pub last_scan_time: Option<i64>,
+    pub permission_errors: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -59,6 +61,7 @@ pub struct LargeItem {
 pub struct TypeBreakdownResult {
     pub types: Vec<TypeStat>,
     pub last_scan_time: Option<i64>,
+    pub permission_errors: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -76,6 +79,7 @@ pub struct SearchResult {
     pub files: Vec<SearchHit>,
     pub total_matches: usize,
     pub last_scan_time: Option<i64>,
+    pub permission_errors: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -97,11 +101,11 @@ pub struct SearchHit {
 
 /// Resolve the target path: if `path` is None, use the root_path from the
 /// latest completed scan. Returns `(resolved_path, last_scan_time)`.
-fn resolve_path(db: &Database, path: Option<&str>) -> Result<(String, Option<i64>)> {
+fn resolve_path(db: &Database, path: Option<&str>) -> Result<(String, Option<i64>, u64)> {
     let scan = db.latest_scan()?;
     match (path, &scan) {
-        (Some(p), _) => Ok((p.to_string(), scan.as_ref().and_then(|s| s.completed_at))),
-        (None, Some(s)) => Ok((s.root_path.clone(), s.completed_at)),
+        (Some(p), _) => Ok((p.to_string(), scan.as_ref().and_then(|s| s.completed_at), scan.as_ref().map(|s| s.permission_errors).unwrap_or(0))),
+        (None, Some(s)) => Ok((s.root_path.clone(), s.completed_at, s.permission_errors)),
         (None, None) => anyhow::bail!("no path specified and no completed scan found"),
     }
 }
@@ -109,7 +113,7 @@ fn resolve_path(db: &Database, path: Option<&str>) -> Result<(String, Option<i64
 /// High-level overview of disk usage at a path.
 /// Gets dir_size for the target, lists children with sizes and percentages.
 pub fn query_overview(db: &Database, path: Option<&str>, _depth: u32) -> Result<OverviewResult> {
-    let (target_path, last_scan_time) = resolve_path(db, path)?;
+    let (target_path, last_scan_time, permission_errors) = resolve_path(db, path)?;
 
     // Get dir_size for target path
     let dir_size = db
@@ -167,6 +171,7 @@ pub fn query_overview(db: &Database, path: Option<&str>, _depth: u32) -> Result<
         dir_count,
         children,
         last_scan_time,
+        permission_errors,
     })
 }
 
@@ -180,7 +185,7 @@ pub fn query_large_items(
     extensions: Option<&[String]>,
     older_than_days: Option<u32>,
 ) -> Result<LargeItemResult> {
-    let (target_path, last_scan_time) = resolve_path(db, path)?;
+    let (target_path, last_scan_time, permission_errors) = resolve_path(db, path)?;
     let path_filter = Some(target_path.as_str());
 
     let mut items: Vec<LargeItem> = Vec::new();
@@ -256,6 +261,7 @@ pub fn query_large_items(
     Ok(LargeItemResult {
         items,
         last_scan_time,
+        permission_errors,
     })
 }
 
@@ -270,6 +276,7 @@ pub fn query_usage_by_type(
         .context("no completed scan found")?;
 
     let last_scan_time = scan.completed_at;
+    let permission_errors = scan.permission_errors;
     let stats = db.extension_stats(scan.id, limit)?;
 
     // Compute total size for percentage calculation
@@ -297,6 +304,7 @@ pub fn query_usage_by_type(
     Ok(TypeBreakdownResult {
         types,
         last_scan_time,
+        permission_errors,
     })
 }
 
@@ -311,6 +319,7 @@ pub fn query_search(
 ) -> Result<SearchResult> {
     let scan = db.latest_scan()?;
     let last_scan_time = scan.as_ref().and_then(|s| s.completed_at);
+    let permission_errors = scan.as_ref().map(|s| s.permission_errors).unwrap_or(0);
 
     let entries = if let Some(pattern) = name_pattern {
         // Use FTS search when a name pattern is provided
@@ -354,6 +363,7 @@ pub fn query_search(
         files,
         total_matches,
         last_scan_time,
+        permission_errors,
     })
 }
 
@@ -387,6 +397,7 @@ pub struct TrendsResult {
     pub trends: Vec<TrendItem>,
     pub period: String,
     pub last_scan_time: Option<i64>,
+    pub permission_errors: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -411,6 +422,7 @@ pub fn query_trends(
 ) -> Result<TrendsResult> {
     let scan = db.latest_scan()?;
     let last_scan_time = scan.as_ref().and_then(|s| s.completed_at);
+    let permission_errors = scan.as_ref().map(|s| s.permission_errors).unwrap_or(0);
 
     // Convert period to seconds
     let period_secs: i64 = match period {
@@ -447,6 +459,7 @@ pub fn query_trends(
         trends,
         period: period.to_string(),
         last_scan_time,
+        permission_errors,
     })
 }
 
@@ -599,6 +612,7 @@ mod tests {
             files_added: 4,
             files_modified: 0,
             files_deleted: 0,
+            permission_errors: 0,
         };
         db.complete_scan(scan_id, &stats).expect("complete_scan");
 

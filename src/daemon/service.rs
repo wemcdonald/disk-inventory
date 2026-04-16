@@ -116,6 +116,11 @@ fn install_launchd(binary: &PathBuf) -> Result<()> {
     println!("\nTo check status: disk-inventory daemon status");
     println!("To stop:         disk-inventory daemon uninstall");
 
+    println!();
+    println!("  The service will appear in System Settings → Privacy & Security");
+    println!("  → Full Disk Access after its first scan attempt.");
+    println!("  Toggle it on there for complete scan results.");
+
     Ok(())
 }
 

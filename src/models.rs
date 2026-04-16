@@ -141,6 +141,7 @@ pub struct ScanInfo {
     pub files_added: u64,
     pub files_modified: u64,
     pub files_deleted: u64,
+    pub permission_errors: u64,
     pub status: ScanStatus,
 }
 

@@ -36,7 +36,7 @@ pub fn run_crawl(db: &Database, root: &Path, config: &Config) -> Result<ScanInfo
         };
         let _ = db.update_scan_progress(scan_id, &progress);
     };
-    let entries = walker::walk_directory(root, scan_id, config, Some(&progress_cb))?;
+    let (entries, permission_errors) = walker::walk_directory(root, scan_id, config, Some(&progress_cb))?;
 
     tracing::info!("Walking complete: {} entries found. Inserting into database...", entries.len());
 
@@ -132,6 +132,7 @@ pub fn run_crawl(db: &Database, root: &Path, config: &Config) -> Result<ScanInfo
         files_added: total_files + total_dirs, // first scan: everything is "added"
         files_modified: 0,
         files_deleted: deleted_count,
+        permission_errors,
     };
 
     db.complete_scan(scan_id, &stats)?;
@@ -202,7 +203,7 @@ pub fn run_incremental_crawl(db: &Database, root: &Path, config: &Config) -> Res
         };
         let _ = db.update_scan_progress(scan_id, &progress);
     };
-    let (entries, dirs_scanned, dirs_skipped) =
+    let (entries, dirs_scanned, dirs_skipped, permission_errors) =
         walker::walk_directory_incremental(root, scan_id, config, prev_scan_time, Some(&progress_cb))?;
 
     let total_entries = entries.len();
@@ -296,6 +297,7 @@ pub fn run_incremental_crawl(db: &Database, root: &Path, config: &Config) -> Res
         files_added: 0,
         files_modified: 0,
         files_deleted: deleted_count,
+        permission_errors,
     };
     db.complete_scan(scan_id, &stats)?;
 

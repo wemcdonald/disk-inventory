@@ -56,6 +56,7 @@ pub fn create_schema(conn: &Connection) -> anyhow::Result<()> {
             files_added     INTEGER DEFAULT 0,
             files_modified  INTEGER DEFAULT 0,
             files_deleted   INTEGER DEFAULT 0,
+            permission_errors INTEGER DEFAULT 0,
             status          TEXT DEFAULT 'running',
             progress        TEXT
         );
@@ -128,6 +129,9 @@ pub fn create_schema(conn: &Connection) -> anyhow::Result<()> {
     // ALTER TABLE … ADD COLUMN is a no-op if the column already exists on
     // newer SQLite versions, but older ones may error — so we ignore errors.
     let _ = conn.execute_batch("ALTER TABLE scans ADD COLUMN progress TEXT;");
+
+    // Migration: add `permission_errors` column to existing databases.
+    let _ = conn.execute_batch("ALTER TABLE scans ADD COLUMN permission_errors INTEGER DEFAULT 0;");
 
     // Migration: if FTS5 table has a 'path' column (old schema), rebuild it with name-only.
     // Drop old triggers, old FTS table, then the CREATE VIRTUAL TABLE above will recreate.

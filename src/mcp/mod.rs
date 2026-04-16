@@ -48,6 +48,14 @@ impl DiskInventoryServer {
             .collect();
 
         let mut content = Vec::new();
+        if result.permission_errors > 0 {
+            content.push(Content::text(format!(
+                "Note: The last scan encountered {} permission errors — some directories are not indexed. \
+                 For complete results, grant Full Disk Access in System Settings → Privacy & Security → Full Disk Access. \
+                 To open the settings pane directly, run: open \"x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles\"",
+                result.permission_errors,
+            )));
+        }
         if !cloud_children.is_empty() {
             let total_logical: u64 = cloud_children.iter().map(|c| c.total_size).sum();
             let total_disk: u64 = cloud_children.iter().map(|c| c.disk_bytes).sum();
@@ -87,6 +95,14 @@ impl DiskInventoryServer {
             .collect();
 
         let mut content = Vec::new();
+        if result.permission_errors > 0 {
+            content.push(Content::text(format!(
+                "Note: The last scan encountered {} permission errors — some directories are not indexed. \
+                 For complete results, grant Full Disk Access in System Settings → Privacy & Security → Full Disk Access. \
+                 To open the settings pane directly, run: open \"x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles\"",
+                result.permission_errors,
+            )));
+        }
         if !divergent.is_empty() {
             let count = divergent.len();
             let logical_sum: u64 = divergent.iter().map(|i| i.size_bytes).sum();
@@ -115,9 +131,19 @@ impl DiskInventoryServer {
             params.limit.unwrap_or(25),
         )
         .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        Ok(CallToolResult::success(vec![Content::text(
+        let mut content = Vec::new();
+        if result.permission_errors > 0 {
+            content.push(Content::text(format!(
+                "Note: The last scan encountered {} permission errors — some directories are not indexed. \
+                 For complete results, grant Full Disk Access in System Settings → Privacy & Security → Full Disk Access. \
+                 To open the settings pane directly, run: open \"x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles\"",
+                result.permission_errors,
+            )));
+        }
+        content.push(Content::text(
             serde_json::to_string_pretty(&result).unwrap(),
-        )]))
+        ));
+        Ok(CallToolResult::success(content))
     }
 
     #[tool(description = "Search files by name pattern, size range, and date range. Reports both logical size (size_bytes) and on-disk size (disk_bytes).")]
@@ -134,12 +160,22 @@ impl DiskInventoryServer {
             params.limit.unwrap_or(50),
         )
         .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        Ok(CallToolResult::success(vec![Content::text(
+        let mut content = Vec::new();
+        if result.permission_errors > 0 {
+            content.push(Content::text(format!(
+                "Note: The last scan encountered {} permission errors — some directories are not indexed. \
+                 For complete results, grant Full Disk Access in System Settings → Privacy & Security → Full Disk Access. \
+                 To open the settings pane directly, run: open \"x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles\"",
+                result.permission_errors,
+            )));
+        }
+        content.push(Content::text(
             serde_json::to_string_pretty(&result).unwrap(),
-        )]))
+        ));
+        Ok(CallToolResult::success(content))
     }
 
-    #[tool(description = "Check index freshness, active scan progress, and scan status.")]
+    #[tool(description = "Check index freshness, scan status, or trigger a rescan. Returns permission_errors count — if > 0, inform the user that Full Disk Access in System Settings would give complete results.")]
     async fn scan_status(
         &self,
         Parameters(_params): Parameters<ScanStatusParams>,
@@ -204,9 +240,19 @@ impl DiskInventoryServer {
             params.limit.unwrap_or(20),
         )
         .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        Ok(CallToolResult::success(vec![Content::text(
+        let mut content = Vec::new();
+        if result.permission_errors > 0 {
+            content.push(Content::text(format!(
+                "Note: The last scan encountered {} permission errors — some directories are not indexed. \
+                 For complete results, grant Full Disk Access in System Settings → Privacy & Security → Full Disk Access. \
+                 To open the settings pane directly, run: open \"x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles\"",
+                result.permission_errors,
+            )));
+        }
+        content.push(Content::text(
             serde_json::to_string_pretty(&result).unwrap(),
-        )]))
+        ));
+        Ok(CallToolResult::success(content))
     }
 }
 

@@ -59,15 +59,28 @@ pub struct FileEntry {
 
 impl FileEntry {
     /// Actual disk consumption in bytes.
-    /// Uses allocated blocks (blocks * 512) which accounts for APFS clones,
-    /// sparse files, and compression. Falls back to logical size if blocks is 0
-    /// (e.g., on non-Unix platforms).
+    ///
+    /// On Unix, uses allocated blocks (`blocks * 512`) which correctly reports
+    /// zero for APFS dataless/cloud files, sparse files with no data, and
+    /// ext4 inline-data files. Also accounts for compression (APFS decmpfs)
+    /// and sparse holes.
+    ///
+    /// On non-Unix platforms, falls back to logical size since block counts
+    /// aren't available.
     pub fn disk_size(&self) -> u64 {
-        if self.blocks > 0 {
+        if cfg!(unix) {
             self.blocks * 512
         } else {
             self.size_bytes
         }
+    }
+
+    /// True when the file's logical size is non-zero but no disk blocks are
+    /// allocated — i.e. the data is not materialized locally.
+    /// Covers APFS dataless files (cloud storage placeholders),
+    /// fully-sparse files, and similar.
+    pub fn is_dataless(&self) -> bool {
+        self.file_type == FileType::File && self.size_bytes > 0 && self.blocks == 0
     }
 }
 
@@ -359,6 +372,69 @@ mod tests {
         assert!(!s.is_empty());
         let s = format_size(1_073_741_824);
         assert!(!s.is_empty());
+    }
+
+    #[test]
+    fn test_disk_size_normal_file() {
+        let entry = FileEntry {
+            id: None, path: String::new(), parent_path: String::new(),
+            name: String::new(), extension: None, file_type: FileType::File,
+            inode: 0, device_id: 0, hardlink_count: 1, symlink_target: None,
+            size_bytes: 4096, blocks: 8,
+            mtime: 0, ctime: 0, atime: 0, birth_time: None,
+            uid: 0, gid: 0, mode: 0, scan_id: 1, first_seen_scan: 1,
+            is_deleted: false, depth: 0, path_components: 0,
+        };
+        assert_eq!(entry.disk_size(), 4096);
+        assert!(!entry.is_dataless());
+    }
+
+    #[test]
+    fn test_disk_size_dataless_cloud_file() {
+        let entry = FileEntry {
+            id: None, path: String::new(), parent_path: String::new(),
+            name: String::new(), extension: None, file_type: FileType::File,
+            inode: 0, device_id: 0, hardlink_count: 1, symlink_target: None,
+            size_bytes: 2_626_540, blocks: 0,
+            mtime: 0, ctime: 0, atime: 0, birth_time: None,
+            uid: 0, gid: 0, mode: 0, scan_id: 1, first_seen_scan: 1,
+            is_deleted: false, depth: 0, path_components: 0,
+        };
+        if cfg!(unix) {
+            assert_eq!(entry.disk_size(), 0);
+        }
+        assert!(entry.is_dataless());
+    }
+
+    #[test]
+    fn test_disk_size_sparse_file() {
+        let entry = FileEntry {
+            id: None, path: String::new(), parent_path: String::new(),
+            name: String::new(), extension: None, file_type: FileType::File,
+            inode: 0, device_id: 0, hardlink_count: 1, symlink_target: None,
+            size_bytes: 1_073_741_824, blocks: 8,
+            mtime: 0, ctime: 0, atime: 0, birth_time: None,
+            uid: 0, gid: 0, mode: 0, scan_id: 1, first_seen_scan: 1,
+            is_deleted: false, depth: 0, path_components: 0,
+        };
+        if cfg!(unix) {
+            assert_eq!(entry.disk_size(), 4096);
+        }
+        assert!(!entry.is_dataless());
+    }
+
+    #[test]
+    fn test_is_dataless_directory_not_dataless() {
+        let entry = FileEntry {
+            id: None, path: String::new(), parent_path: String::new(),
+            name: String::new(), extension: None, file_type: FileType::Directory,
+            inode: 0, device_id: 0, hardlink_count: 1, symlink_target: None,
+            size_bytes: 0, blocks: 0,
+            mtime: 0, ctime: 0, atime: 0, birth_time: None,
+            uid: 0, gid: 0, mode: 0, scan_id: 1, first_seen_scan: 1,
+            is_deleted: false, depth: 0, path_components: 0,
+        };
+        assert!(!entry.is_dataless());
     }
 
     #[test]

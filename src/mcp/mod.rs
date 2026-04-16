@@ -17,6 +17,7 @@ use tools::*;
 #[derive(Clone)]
 pub struct DiskInventoryServer {
     db: Arc<Database>,
+    #[allow(dead_code)] // used by #[tool_router] macro
     tool_router: ToolRouter<Self>,
 }
 
@@ -29,7 +30,7 @@ impl DiskInventoryServer {
         }
     }
 
-    #[tool(description = "Get high-level disk usage summary with directory breakdown. Best starting point.")]
+    #[tool(description = "Get high-level disk usage summary with directory breakdown. Best starting point. Sizes reported as both logical (size_bytes/total_size) and on-disk (disk_bytes/total_disk_bytes). When these differ, files may be cloud placeholders, sparse, or compressed.")]
     async fn disk_overview(
         &self,
         Parameters(params): Parameters<DiskOverviewParams>,
@@ -40,12 +41,30 @@ impl DiskInventoryServer {
             params.depth.unwrap_or(1).min(3),
         )
         .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&result).unwrap(),
-        )]))
+        let json = serde_json::to_string_pretty(&result).unwrap();
+
+        let cloud_children: Vec<_> = result.children.iter()
+            .filter(|c| c.disk_bytes != c.total_size && c.total_size > 0)
+            .collect();
+
+        let mut content = Vec::new();
+        if !cloud_children.is_empty() {
+            let total_logical: u64 = cloud_children.iter().map(|c| c.total_size).sum();
+            let total_disk: u64 = cloud_children.iter().map(|c| c.disk_bytes).sum();
+            content.push(Content::text(format!(
+                "Note: {} of content in this path has a different on-disk size than logical size \
+                 (logical: {}, on-disk: {}). This typically means cloud-only/streamed files, \
+                 sparse files, or filesystem compression. Check disk_bytes vs size_bytes fields.",
+                crate::models::format_size(total_logical),
+                crate::models::format_size(total_logical),
+                crate::models::format_size(total_disk),
+            )));
+        }
+        content.push(Content::text(json));
+        Ok(CallToolResult::success(content))
     }
 
-    #[tool(description = "Find the largest files or directories. Filter by type, extensions, and age.")]
+    #[tool(description = "Find the largest files or directories. Filter by type, extensions, and age. Reports both logical size (size_bytes) and on-disk size (disk_bytes). Cloud-only files show disk_bytes=0.")]
     async fn find_large_items(
         &self,
         Parameters(params): Parameters<FindLargeItemsParams>,
@@ -60,9 +79,29 @@ impl DiskInventoryServer {
             params.older_than_days,
         )
         .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&result).unwrap(),
-        )]))
+
+        let json = serde_json::to_string_pretty(&result).unwrap();
+
+        let divergent: Vec<_> = result.items.iter()
+            .filter(|i| i.disk_bytes != i.size_bytes && i.size_bytes > 0)
+            .collect();
+
+        let mut content = Vec::new();
+        if !divergent.is_empty() {
+            let count = divergent.len();
+            let logical_sum: u64 = divergent.iter().map(|i| i.size_bytes).sum();
+            let disk_sum: u64 = divergent.iter().map(|i| i.disk_bytes).sum();
+            content.push(Content::text(format!(
+                "Note: {} of {} items have different logical vs on-disk sizes \
+                 (logical total: {}, on-disk total: {}). \
+                 These may be cloud-only files, sparse, or compressed.",
+                count, result.items.len(),
+                crate::models::format_size(logical_sum),
+                crate::models::format_size(disk_sum),
+            )));
+        }
+        content.push(Content::text(json));
+        Ok(CallToolResult::success(content))
     }
 
     #[tool(description = "Break down disk usage by file type/extension.")]
@@ -81,7 +120,7 @@ impl DiskInventoryServer {
         )]))
     }
 
-    #[tool(description = "Search files by name pattern, size range, and date range.")]
+    #[tool(description = "Search files by name pattern, size range, and date range. Reports both logical size (size_bytes) and on-disk size (disk_bytes).")]
     async fn search_files(
         &self,
         Parameters(params): Parameters<SearchFilesParams>,

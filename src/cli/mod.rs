@@ -43,16 +43,17 @@ fn open_db() -> Result<Database> {
     Ok(db)
 }
 
-/// Format size for table display. When disk and logical sizes differ,
-/// show disk size with a parenthetical note about logical size.
+/// Format size for table display. When disk and logical sizes differ
+/// meaningfully, show disk size with a parenthetical note about logical size.
 fn display_size(disk_bytes: u64, size_bytes: u64) -> String {
     let disk_human = crate::models::format_size(disk_bytes);
-    if disk_bytes == size_bytes || size_bytes == 0 {
+    let logical_human = crate::models::format_size(size_bytes);
+    if disk_human == logical_human || size_bytes == 0 {
         disk_human
     } else if disk_bytes == 0 {
-        format!("0 B (logical: {})", crate::models::format_size(size_bytes))
+        format!("0 B (logical: {})", logical_human)
     } else {
-        format!("{} (logical: {})", disk_human, crate::models::format_size(size_bytes))
+        format!("{} (logical: {})", disk_human, logical_human)
     }
 }
 

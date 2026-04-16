@@ -139,6 +139,7 @@ fn uninstall_launchd() -> Result<()> {
         std::fs::remove_file(&path)?;
         println!("Service uninstalled.");
         println!("  Removed: {}", path.display());
+        println!("  Note: If running in foreground mode (daemon run), stop it with Ctrl-C.");
     } else {
         println!(
             "No service installed (plist not found at {})",
@@ -230,6 +231,7 @@ fn uninstall_systemd() -> Result<()> {
             .status();
         println!("Service uninstalled.");
         println!("  Removed: {}", path.display());
+        println!("  Note: If running in foreground mode (daemon run), stop it with Ctrl-C.");
     } else {
         println!(
             "No service installed (unit not found at {})",

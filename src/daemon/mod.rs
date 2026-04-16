@@ -59,6 +59,29 @@ pub fn run_incremental(config: &Config) -> Result<()> {
 pub async fn run_daemon(config: Config) -> Result<()> {
     let db = Database::open(config.db_path())?;
 
+    // Prevent multiple daemon instances
+    use std::fs::OpenOptions;
+    let lock_path = crate::config::config_dir().join("daemon.lock");
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&lock_path)
+        .context("failed to open daemon lock file")?;
+
+    use std::os::unix::io::AsRawFd;
+    let lock_result = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if lock_result != 0 {
+        anyhow::bail!("Another daemon instance is already running (lock file: {})", lock_path.display());
+    }
+    // Write PID for diagnostics
+    use std::io::Write;
+    let mut lf = &lock_file;
+    let _ = write!(lf, "{}", std::process::id());
+
+    // Keep lock_file alive for the duration of the daemon (do not drop it)
+    let _lock_file = lock_file;
+
     // Scan lock: prevents concurrent crawls from periodic timer, IPC rescan,
     // and watcher from stomping on each other.
     let scanning = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -89,7 +112,7 @@ pub async fn run_daemon(config: Config) -> Result<()> {
             Ok(w) => {
                 tracing::info!("Filesystem watcher enabled ({}s debounce)",
                     config.daemon.watcher_debounce_secs);
-                Some(std::sync::Mutex::new(w))
+                Some(tokio::sync::Mutex::new(w))
             }
             Err(e) => {
                 tracing::warn!("Failed to start filesystem watcher: {}", e);
@@ -168,7 +191,7 @@ pub async fn run_daemon(config: Config) -> Result<()> {
                 if !scanning.load(std::sync::atomic::Ordering::SeqCst) {
                     if let Some(ref watcher_mutex) = watcher {
                         let changed = {
-                            let mut w = watcher_mutex.lock().unwrap();
+                            let mut w = watcher_mutex.lock().await;
                             w.poll()
                         };
                         if let Some(dirs) = changed {
@@ -192,7 +215,7 @@ pub async fn run_daemon(config: Config) -> Result<()> {
 
             // Periodic dir_sizes recompute after watcher updates
             _ = dir_sizes_timer.tick() => {
-                if dirs_dirty {
+                if dirs_dirty && !scanning.load(std::sync::atomic::Ordering::SeqCst) {
                     tracing::info!("Recomputing dir_sizes after watcher updates");
                     if let Err(e) = db.recompute_dir_sizes() {
                         tracing::error!("dir_sizes recompute error: {}", e);

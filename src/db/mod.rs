@@ -65,6 +65,16 @@ impl Database {
         self.conn.lock().expect("database mutex poisoned")
     }
 
+    /// Enter bulk-insert mode. Returns a guard that restores normal durability on drop.
+    /// Only one bulk mode session should be active at a time.
+    pub fn bulk_mode(&self) -> Result<BulkModeGuard<'_>> {
+        let conn = self.conn();
+        conn.execute_batch("PRAGMA synchronous = OFF;")?;
+        drop(conn); // release the mutex
+        Ok(BulkModeGuard { db: self })
+    }
+
+    #[deprecated(note = "use bulk_mode() RAII guard instead")]
     /// Switch to bulk-insert mode (disables synchronous writes).
     pub fn enable_bulk_mode(&self) -> Result<()> {
         let conn = self.conn();
@@ -72,6 +82,7 @@ impl Database {
         Ok(())
     }
 
+    #[deprecated(note = "use bulk_mode() RAII guard instead")]
     /// Return to normal durability mode after bulk operations.
     pub fn disable_bulk_mode(&self) -> Result<()> {
         let conn = self.conn();
@@ -94,6 +105,18 @@ impl Database {
         )
         .context("failed to apply database pragmas")?;
         Ok(())
+    }
+}
+
+/// RAII guard that restores `PRAGMA synchronous = NORMAL` when dropped.
+pub struct BulkModeGuard<'a> {
+    db: &'a Database,
+}
+
+impl<'a> Drop for BulkModeGuard<'a> {
+    fn drop(&mut self) {
+        let conn = self.db.conn();
+        let _ = conn.execute_batch("PRAGMA synchronous = NORMAL;");
     }
 }
 

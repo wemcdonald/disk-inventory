@@ -209,13 +209,18 @@ impl Database {
         Ok(())
     }
 
-    /// Mark any scans stuck in 'running' state as 'failed'.
-    /// Called on startup to clean up after crashes or Ctrl-C.
+    /// Mark any scans stuck in 'running' state as 'failed' if they have been
+    /// running for more than 1 hour. Called on startup to clean up after crashes.
     pub fn cleanup_stale_scans(&self) -> Result<u64> {
         let conn = self.conn();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let cutoff = now - 3600; // 1 hour
         let count = conn.execute(
-            "UPDATE scans SET status = 'failed' WHERE status = 'running'",
-            [],
+            "UPDATE scans SET status = 'failed' WHERE status = 'running' AND started_at < ?1",
+            rusqlite::params![cutoff],
         )?;
         Ok(count as u64)
     }
@@ -357,9 +362,10 @@ impl Database {
     /// Used after watcher updates to refresh aggregates.
     pub fn recompute_dir_sizes(&self) -> Result<()> {
         let conn = self.conn();
-        conn.execute("DELETE FROM dir_sizes", [])?;
         conn.execute_batch(
-            "INSERT INTO dir_sizes (path, total_size, file_count, dir_count, max_depth, largest_file, scan_id)
+            "BEGIN;
+             DELETE FROM dir_sizes;
+             INSERT INTO dir_sizes (path, total_size, file_count, dir_count, max_depth, largest_file, scan_id)
              SELECT
                  d.path,
                  COALESCE(SUM(CASE WHEN f.file_type = 0 THEN f.size_bytes ELSE 0 END), 0),
@@ -372,7 +378,8 @@ impl Database {
              JOIN files f ON f.path >= d.path || '/' AND f.path < d.path || '0'
                  AND f.is_deleted = 0
              WHERE d.file_type = 1 AND d.is_deleted = 0
-             GROUP BY d.path, d.scan_id;"
+             GROUP BY d.path, d.scan_id;
+             COMMIT;"
         )?;
         Ok(())
     }

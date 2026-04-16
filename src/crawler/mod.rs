@@ -40,7 +40,7 @@ pub fn run_crawl(db: &Database, root: &Path, config: &Config) -> Result<ScanInfo
 
     tracing::info!("Walking complete: {} entries found. Inserting into database...", entries.len());
 
-    db.enable_bulk_mode()?;
+    let _bulk = db.bulk_mode()?;
     let total_entries = entries.len();
     let mut inserted: usize = 0;
     for chunk in entries.chunks(10_000) {
@@ -62,7 +62,7 @@ pub fn run_crawl(db: &Database, root: &Path, config: &Config) -> Result<ScanInfo
             tracing::info!("Inserting: {}/{} entries", inserted, total_entries);
         }
     }
-    db.disable_bulk_mode()?;
+    drop(_bulk); // explicitly restore normal mode
 
     tracing::info!("Phase 1 complete: {} entries inserted", total_entries);
 
@@ -187,7 +187,7 @@ pub fn run_incremental_crawl(db: &Database, root: &Path, config: &Config) -> Res
     );
 
     // Phase 1: Incremental walk — only descend into changed directories
-    db.enable_bulk_mode()?;
+    let _bulk = db.bulk_mode()?;
     let progress_cb = |files: u64, dirs: u64, bytes: u64, current_dir: &str| {
         let progress = ScanProgress {
             phase: "walking_incremental".to_string(),
@@ -225,7 +225,7 @@ pub fn run_incremental_crawl(db: &Database, root: &Path, config: &Config) -> Res
             tracing::info!("Inserting: {}/{} entries", inserted, total_entries);
         }
     }
-    db.disable_bulk_mode()?;
+    drop(_bulk); // explicitly restore normal mode
 
     tracing::info!(
         "Incremental walk: {} entries found ({} dirs scanned, {} skipped), {} inserted",

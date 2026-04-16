@@ -14,6 +14,8 @@ pub struct OverviewResult {
     pub path: String,
     pub total_size: u64,
     pub total_size_human: String,
+    pub total_disk_bytes: u64,
+    pub total_disk_bytes_human: String,
     pub file_count: u64,
     pub dir_count: u64,
     pub children: Vec<ChildSummary>,
@@ -26,6 +28,8 @@ pub struct ChildSummary {
     pub name: String,
     pub total_size: u64,
     pub total_size_human: String,
+    pub disk_bytes: u64,
+    pub disk_bytes_human: String,
     pub file_count: u64,
     pub percentage: f64,
     pub is_dir: bool,
@@ -42,6 +46,8 @@ pub struct LargeItem {
     pub path: String,
     pub size_bytes: u64,
     pub size_human: String,
+    pub disk_bytes: u64,
+    pub disk_bytes_human: String,
     pub item_type: String, // "file" or "directory"
     pub modified: Option<i64>,
     pub accessed: Option<i64>,
@@ -78,6 +84,8 @@ pub struct SearchHit {
     pub name: String,
     pub size_bytes: u64,
     pub size_human: String,
+    pub disk_bytes: u64,
+    pub disk_bytes_human: String,
     pub extension: Option<String>,
     pub modified: Option<i64>,
     pub is_dir: bool,
@@ -118,13 +126,13 @@ pub fn query_overview(db: &Database, path: Option<&str>, _depth: u32) -> Result<
     let mut children = Vec::with_capacity(children_entries.len());
     for entry in &children_entries {
         let is_dir = entry.file_type == FileType::Directory;
-        let (child_size, child_file_count) = if is_dir {
+        let (child_size, child_file_count, child_disk) = if is_dir {
             match db.get_dir_size(&entry.path)? {
-                Some(ds) => (ds.total_size, ds.file_count),
-                None => (entry.size_bytes, 0),
+                Some(ds) => (ds.total_size, ds.file_count, ds.total_size),
+                None => (entry.size_bytes, 0, entry.disk_size()),
             }
         } else {
-            (entry.size_bytes, 1)
+            (entry.size_bytes, 1, entry.disk_size())
         };
 
         let percentage = if total_size > 0 {
@@ -138,6 +146,8 @@ pub fn query_overview(db: &Database, path: Option<&str>, _depth: u32) -> Result<
             name: entry.name.clone(),
             total_size: child_size,
             total_size_human: format_size(child_size),
+            disk_bytes: child_disk,
+            disk_bytes_human: format_size(child_disk),
             file_count: child_file_count,
             percentage,
             is_dir,
@@ -151,6 +161,8 @@ pub fn query_overview(db: &Database, path: Option<&str>, _depth: u32) -> Result<
         path: target_path,
         total_size,
         total_size_human: format_size(total_size),
+        total_disk_bytes: dir_size.total_size,
+        total_disk_bytes_human: format_size(dir_size.total_size),
         file_count,
         dir_count,
         children,
@@ -200,10 +212,13 @@ pub fn query_large_items(
         };
 
         for f in files {
+            let f_disk = f.disk_size();
             items.push(LargeItem {
                 path: f.path,
                 size_bytes: f.size_bytes,
                 size_human: format_size(f.size_bytes),
+                disk_bytes: f_disk,
+                disk_bytes_human: format_size(f_disk),
                 item_type: "file".to_string(),
                 modified: Some(f.mtime),
                 accessed: Some(f.atime),
@@ -222,6 +237,8 @@ pub fn query_large_items(
                     path: d.path,
                     size_bytes: d.total_size,
                     size_human: format_size(d.total_size),
+                    disk_bytes: d.total_size,
+                    disk_bytes_human: format_size(d.total_size),
                     item_type: "directory".to_string(),
                     modified: None,
                     accessed: None,
@@ -318,15 +335,19 @@ pub fn query_search(
     let total_matches = entries.len();
     let files = entries
         .into_iter()
-        .map(|e| SearchHit {
+        .map(|e| {
+            let e_disk = e.disk_size();
+            SearchHit {
             path: e.path,
             name: e.name,
             size_bytes: e.size_bytes,
             size_human: format_size(e.size_bytes),
+            disk_bytes: e_disk,
+            disk_bytes_human: format_size(e_disk),
             extension: e.extension,
             modified: Some(e.mtime),
             is_dir: e.file_type == FileType::Directory,
-        })
+        }})
         .collect();
 
     Ok(SearchResult {

@@ -349,6 +349,64 @@ pub fn rescan_directories(
         }
         let dir_str = dir.to_string_lossy().to_string();
 
+        // Fast path: try bulk_readdir (getattrlistbulk on macOS)
+        if let Some(bulk_entries) = platform::bulk_readdir(dir) {
+            let mut entries = Vec::new();
+            for (name, meta) in bulk_entries {
+                if config.is_excluded(&name) {
+                    continue;
+                }
+
+                let path = dir.join(&name);
+                let path_str = path.to_string_lossy().to_string();
+                let symlink_target = if meta.file_type == FileType::Symlink {
+                    std::fs::read_link(&path)
+                        .ok()
+                        .map(|t| t.to_string_lossy().to_string())
+                } else {
+                    None
+                };
+
+                entries.push(FileEntry {
+                    id: None,
+                    path: path_str.clone(),
+                    parent_path: dir_str.clone(),
+                    name: name.clone(),
+                    extension: if meta.file_type == FileType::File {
+                        crate::models::extract_extension(&name)
+                    } else {
+                        None
+                    },
+                    file_type: meta.file_type,
+                    inode: meta.inode,
+                    device_id: meta.device_id,
+                    hardlink_count: meta.hardlink_count,
+                    symlink_target,
+                    size_bytes: meta.size_bytes,
+                    blocks: meta.blocks,
+                    mtime: meta.mtime,
+                    ctime: meta.ctime,
+                    atime: meta.atime,
+                    birth_time: meta.birth_time,
+                    uid: meta.uid,
+                    gid: meta.gid,
+                    mode: meta.mode,
+                    scan_id,
+                    first_seen_scan: scan_id,
+                    is_deleted: false,
+                    depth: crate::models::path_depth(&path_str),
+                    path_components: crate::models::path_component_count(&path_str),
+                });
+            }
+
+            if !entries.is_empty() {
+                db.insert_files(&entries)?;
+                updated += entries.len() as u64;
+            }
+            continue;
+        }
+
+        // Slow path: read_dir + per-file get_metadata
         let read_dir = match std::fs::read_dir(dir) {
             Ok(rd) => rd,
             Err(e) => {

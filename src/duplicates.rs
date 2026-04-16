@@ -26,14 +26,30 @@ pub fn find_duplicates(
         // Tier 2: partial hash (first 4KB)
         let mut partial_groups: HashMap<u64, Vec<&FileEntry>> = HashMap::new();
         for entry in &entries {
-            match hash_partial(&entry.path) {
-                Ok(h) => {
-                    partial_groups.entry(h).or_default().push(entry);
-                }
-                Err(e) => {
-                    warn!("skipping file {} for partial hash: {}", entry.path, e);
-                }
-            }
+            let file_id = entry.id.unwrap_or(-1);
+            let cached = if file_id > 0 {
+                db.get_cached_hash(file_id).ok().and_then(|(p, _)| p)
+            } else {
+                None
+            };
+
+            let hash = match cached {
+                Some(h) => h,
+                None => match hash_partial(&entry.path) {
+                    Ok(h) => {
+                        if file_id > 0 {
+                            let _ = db.save_partial_hash(file_id, h);
+                        }
+                        h
+                    }
+                    Err(e) => {
+                        warn!("skipping file {} for partial hash: {}", entry.path, e);
+                        continue;
+                    }
+                },
+            };
+
+            partial_groups.entry(hash).or_default().push(entry);
         }
 
         // Only keep groups with 2+ files
@@ -45,14 +61,30 @@ pub fn find_duplicates(
             // Tier 3: full hash
             let mut full_groups: HashMap<u64, Vec<&FileEntry>> = HashMap::new();
             for entry in &candidates {
-                match hash_full(&entry.path) {
-                    Ok(h) => {
-                        full_groups.entry(h).or_default().push(entry);
-                    }
-                    Err(e) => {
-                        warn!("skipping file {} for full hash: {}", entry.path, e);
-                    }
-                }
+                let file_id = entry.id.unwrap_or(-1);
+                let cached = if file_id > 0 {
+                    db.get_cached_hash(file_id).ok().and_then(|(_, f)| f)
+                } else {
+                    None
+                };
+
+                let hash = match cached {
+                    Some(h) => h,
+                    None => match hash_full(&entry.path) {
+                        Ok(h) => {
+                            if file_id > 0 {
+                                let _ = db.save_full_hash(file_id, h);
+                            }
+                            h
+                        }
+                        Err(e) => {
+                            warn!("skipping file {} for full hash: {}", entry.path, e);
+                            continue;
+                        }
+                    },
+                };
+
+                full_groups.entry(hash).or_default().push(entry);
             }
 
             // Build DuplicateGroup for groups with 2+ confirmed duplicates
@@ -290,6 +322,20 @@ mod tests {
 
         let groups = find_duplicates(&db, None, 0, None, 100).unwrap();
         assert!(groups.is_empty(), "all unique files should yield no duplicates");
+    }
+
+    #[test]
+    fn test_hash_caching_across_runs() {
+        let (db, _dir) = setup_duplicate_test();
+
+        // First run — populates cache
+        let groups1 = find_duplicates(&db, None, 0, None, 100).unwrap();
+        assert_eq!(groups1.len(), 1);
+
+        // Second run — should use cached hashes and get same results
+        let groups2 = find_duplicates(&db, None, 0, None, 100).unwrap();
+        assert_eq!(groups2.len(), 1);
+        assert_eq!(groups2[0].files.len(), groups1[0].files.len());
     }
 
     #[test]

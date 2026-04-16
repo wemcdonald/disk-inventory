@@ -724,6 +724,67 @@ impl Database {
     }
 
     // -----------------------------------------------------------------------
+    // Hash cache
+    // -----------------------------------------------------------------------
+
+    /// Look up cached hashes for a file by its DB id.
+    /// Returns (hash_partial, hash_full) — either may be None.
+    pub fn get_cached_hash(&self, file_id: i64) -> Result<(Option<u64>, Option<u64>)> {
+        let conn = self.conn();
+        let result = conn
+            .query_row(
+                "SELECT hash_partial, hash_full FROM file_hashes WHERE file_id = ?1",
+                params![file_id],
+                |row| {
+                    let partial: Option<Vec<u8>> = row.get(0)?;
+                    let full: Option<Vec<u8>> = row.get(1)?;
+                    Ok((
+                        partial.and_then(|b| {
+                            if b.len() == 8 {
+                                Some(u64::from_le_bytes(b.try_into().unwrap()))
+                            } else {
+                                None
+                            }
+                        }),
+                        full.and_then(|b| {
+                            if b.len() == 8 {
+                                Some(u64::from_le_bytes(b.try_into().unwrap()))
+                            } else {
+                                None
+                            }
+                        }),
+                    ))
+                },
+            )
+            .optional()?;
+        Ok(result.unwrap_or((None, None)))
+    }
+
+    /// Save a partial hash for a file. Inserts or updates.
+    pub fn save_partial_hash(&self, file_id: i64, hash: u64) -> Result<()> {
+        let conn = self.conn();
+        conn.execute(
+            "INSERT INTO file_hashes (file_id, hash_partial, hash_algorithm)
+             VALUES (?1, ?2, 'xxhash64')
+             ON CONFLICT(file_id) DO UPDATE SET hash_partial = ?2",
+            params![file_id, hash.to_le_bytes().to_vec()],
+        )?;
+        Ok(())
+    }
+
+    /// Save a full hash for a file. Inserts or updates.
+    pub fn save_full_hash(&self, file_id: i64, hash: u64) -> Result<()> {
+        let conn = self.conn();
+        conn.execute(
+            "INSERT INTO file_hashes (file_id, hash_full, hash_algorithm)
+             VALUES (?1, ?2, 'xxhash64')
+             ON CONFLICT(file_id) DO UPDATE SET hash_full = ?2",
+            params![file_id, hash.to_le_bytes().to_vec()],
+        )?;
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
     // Duplicate detection
     // -----------------------------------------------------------------------
 
@@ -1746,6 +1807,46 @@ mod tests {
         assert_eq!(p.bytes_so_far, 456789);
         assert_eq!(p.current_dir, "/test/some/path");
         assert_eq!(p.elapsed_secs, 10);
+    }
+
+    #[test]
+    fn test_hash_cache_roundtrip() {
+        let db = Database::open_in_memory().unwrap();
+        let scan_id = db.create_scan("/test").unwrap();
+
+        // Insert a file using the test helper
+        let entry = make_entry(
+            "/test/file.txt",
+            "/test",
+            "file.txt",
+            Some("txt"),
+            FileType::File,
+            100,
+            scan_id,
+            2,
+            2,
+        );
+        db.insert_files(&[entry]).unwrap();
+
+        let files = db.largest_files(None, 1).unwrap();
+        let file_id = files[0].id.unwrap();
+
+        // Initially no cache
+        let (partial, full) = db.get_cached_hash(file_id).unwrap();
+        assert!(partial.is_none());
+        assert!(full.is_none());
+
+        // Save partial
+        db.save_partial_hash(file_id, 0xDEADBEEF).unwrap();
+        let (partial, full) = db.get_cached_hash(file_id).unwrap();
+        assert_eq!(partial, Some(0xDEADBEEF));
+        assert!(full.is_none());
+
+        // Save full
+        db.save_full_hash(file_id, 0xCAFEBABE).unwrap();
+        let (partial, full) = db.get_cached_hash(file_id).unwrap();
+        assert_eq!(partial, Some(0xDEADBEEF));
+        assert_eq!(full, Some(0xCAFEBABE));
     }
 
     #[test]

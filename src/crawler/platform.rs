@@ -46,6 +46,7 @@ pub fn get_metadata(path: &Path) -> std::io::Result<EntryMeta> {
 /// Returns `None` when no bulk optimization is available, signalling the caller
 /// should fall back to per-file `get_metadata()`.
 #[cfg(target_os = "macos")]
+#[allow(unused_assignments)] // offset is incremented by read macros on the last field
 pub fn bulk_readdir(dir_path: &Path) -> Option<Vec<(String, EntryMeta)>> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;

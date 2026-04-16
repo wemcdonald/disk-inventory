@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use std::path::PathBuf;
 
 const LABEL: &str = "com.disk-inventory.daemon";
+#[cfg(target_os = "linux")]
 const SERVICE_NAME: &str = "disk-inventory";
 
 /// Install the daemon as an OS service.

@@ -6,6 +6,7 @@ use crate::db::Database;
 use crate::models::format_size;
 use anyhow::{Context, Result};
 use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 
@@ -57,6 +58,10 @@ pub fn run_incremental(config: &Config) -> Result<()> {
 /// Run the daemon: initial crawl, then periodic rescans + IPC.
 pub async fn run_daemon(config: Config) -> Result<()> {
     let db = Database::open(config.db_path())?;
+
+    // Scan lock: prevents concurrent crawls from periodic timer, IPC rescan,
+    // and watcher from stomping on each other.
+    let scanning = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     // Initial full crawl
     for watch_path in config.resolved_watch_paths() {
@@ -122,17 +127,22 @@ pub async fn run_daemon(config: Config) -> Result<()> {
         tokio::select! {
             // Periodic rescan
             _ = scan_timer.tick() => {
-                tracing::info!("Periodic incremental scan starting");
-                for watch_path in config.resolved_watch_paths() {
-                    if !watch_path.exists() { continue; }
-                    match crawler::run_incremental_crawl(&db, &watch_path, &config) {
-                        Ok(scan) => tracing::info!(
-                            "Incremental scan complete: {} files, {}",
-                            scan.total_files,
-                            format_size(scan.total_size)
-                        ),
-                        Err(e) => tracing::error!("Incremental scan failed: {}", e),
+                if scanning.compare_exchange(false, true, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst).is_ok() {
+                    tracing::info!("Periodic incremental scan starting");
+                    for watch_path in config.resolved_watch_paths() {
+                        if !watch_path.exists() { continue; }
+                        match crawler::run_incremental_crawl(&db, &watch_path, &config) {
+                            Ok(scan) => tracing::info!(
+                                "Incremental scan complete: {} files, {}",
+                                scan.total_files,
+                                format_size(scan.total_size)
+                            ),
+                            Err(e) => tracing::error!("Incremental scan failed: {}", e),
+                        }
                     }
+                    scanning.store(false, std::sync::atomic::Ordering::SeqCst);
+                } else {
+                    tracing::info!("Periodic scan skipped: scan already in progress");
                 }
             }
 
@@ -142,8 +152,9 @@ pub async fn run_daemon(config: Config) -> Result<()> {
                     Ok((stream, _)) => {
                         let db = db.clone();
                         let config = config.clone();
+                        let scanning = Arc::clone(&scanning);
                         tokio::spawn(async move {
-                            if let Err(e) = handle_ipc_connection(stream, &db, &config).await {
+                            if let Err(e) = handle_ipc_connection(stream, &db, &config, &scanning).await {
                                 tracing::error!("IPC error: {}", e);
                             }
                         });
@@ -154,23 +165,25 @@ pub async fn run_daemon(config: Config) -> Result<()> {
 
             // Filesystem watcher poll
             _ = watcher_timer.tick() => {
-                if let Some(ref watcher_mutex) = watcher {
-                    let changed = {
-                        let mut w = watcher_mutex.lock().unwrap();
-                        w.poll()
-                    };
-                    if let Some(dirs) = changed {
-                        if !dirs.is_empty() {
-                            tracing::debug!("Watcher: {} directories changed", dirs.len());
-                            let dir_vec: Vec<_> = dirs.into_iter().collect();
-                            match crawler::rescan_directories(&db, &dir_vec, &config) {
-                                Ok(n) => {
-                                    if n > 0 {
-                                        tracing::info!("Watcher rescan: {} entries updated", n);
-                                        dirs_dirty = true;
+                if !scanning.load(std::sync::atomic::Ordering::SeqCst) {
+                    if let Some(ref watcher_mutex) = watcher {
+                        let changed = {
+                            let mut w = watcher_mutex.lock().unwrap();
+                            w.poll()
+                        };
+                        if let Some(dirs) = changed {
+                            if !dirs.is_empty() {
+                                tracing::debug!("Watcher: {} directories changed", dirs.len());
+                                let dir_vec: Vec<_> = dirs.into_iter().collect();
+                                match crawler::rescan_directories(&db, &dir_vec, &config) {
+                                    Ok(n) => {
+                                        if n > 0 {
+                                            tracing::info!("Watcher rescan: {} entries updated", n);
+                                            dirs_dirty = true;
+                                        }
                                     }
+                                    Err(e) => tracing::error!("Watcher rescan error: {}", e),
                                 }
-                                Err(e) => tracing::error!("Watcher rescan error: {}", e),
                             }
                         }
                     }
@@ -204,6 +217,7 @@ async fn handle_ipc_connection(
     stream: tokio::net::UnixStream,
     db: &Database,
     config: &Config,
+    scanning: &Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
@@ -217,33 +231,39 @@ async fn handle_ipc_connection(
             None => r#"{"status":"no_scans"}"#.to_string(),
         },
         c if c.starts_with("rescan") => {
-            let path = c
-                .strip_prefix("rescan")
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty());
-            let paths: Vec<PathBuf> = if let Some(p) = path {
-                vec![PathBuf::from(p)]
+            if scanning.compare_exchange(false, true, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst).is_err() {
+                r#"{"status":"scan_already_running"}"#.to_string()
             } else {
-                config.resolved_watch_paths()
-            };
+                let path = c
+                    .strip_prefix("rescan")
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty());
+                let paths: Vec<PathBuf> = if let Some(p) = path {
+                    vec![PathBuf::from(p)]
+                } else {
+                    config.resolved_watch_paths()
+                };
 
-            // Spawn the crawl in the background so the IPC client gets
-            // an immediate response instead of blocking for the full scan.
-            let db = db.clone();
-            let config = config.clone();
-            tokio::spawn(async move {
-                for watch_path in &paths {
-                    if watch_path.exists() {
-                        match crawler::run_incremental_crawl(&db, watch_path, &config) {
-                            Ok(scan) => {
-                                tracing::info!("Rescan complete: {} files", scan.total_files)
+                // Spawn the crawl in the background so the IPC client gets
+                // an immediate response instead of blocking for the full scan.
+                let db = db.clone();
+                let config = config.clone();
+                let scanning = Arc::clone(scanning);
+                tokio::spawn(async move {
+                    for watch_path in &paths {
+                        if watch_path.exists() {
+                            match crawler::run_incremental_crawl(&db, watch_path, &config) {
+                                Ok(scan) => {
+                                    tracing::info!("Rescan complete: {} files", scan.total_files)
+                                }
+                                Err(e) => tracing::error!("Rescan failed: {}", e),
                             }
-                            Err(e) => tracing::error!("Rescan failed: {}", e),
                         }
                     }
-                }
-            });
-            r#"{"status":"rescan_started"}"#.to_string()
+                    scanning.store(false, std::sync::atomic::Ordering::SeqCst);
+                });
+                r#"{"status":"rescan_started"}"#.to_string()
+            }
         }
         _ => r#"{"error":"unknown command. Use: status, rescan [path]"}"#.to_string(),
     };

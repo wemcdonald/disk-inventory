@@ -43,6 +43,19 @@ fn open_db() -> Result<Database> {
     Ok(db)
 }
 
+/// Format size for table display. When disk and logical sizes differ,
+/// show disk size with a parenthetical note about logical size.
+fn display_size(disk_bytes: u64, size_bytes: u64) -> String {
+    let disk_human = crate::models::format_size(disk_bytes);
+    if disk_bytes == size_bytes || size_bytes == 0 {
+        disk_human
+    } else if disk_bytes == 0 {
+        format!("0 B (logical: {})", crate::models::format_size(size_bytes))
+    } else {
+        format!("{} (logical: {})", disk_human, crate::models::format_size(size_bytes))
+    }
+}
+
 pub fn run_usage(path: Option<String>, depth: u32, format: &OutputFormat) -> Result<()> {
     let db = open_db()?;
     let result = query::query_overview(&db, path.as_deref(), depth)?;
@@ -56,7 +69,7 @@ pub fn run_usage(path: Option<String>, depth: u32, format: &OutputFormat) -> Res
                 .map(|c| {
                     vec![
                         c.name.clone(),
-                        c.total_size_human.clone(),
+                        display_size(c.disk_bytes, c.total_size),
                         c.file_count.to_string(),
                         format!("{:.1}", c.percentage),
                     ]
@@ -77,7 +90,7 @@ pub fn run_usage(path: Option<String>, depth: u32, format: &OutputFormat) -> Res
                 .map(|c| {
                     vec![
                         c.name.clone(),
-                        c.total_size_human.clone(),
+                        display_size(c.disk_bytes, c.total_size),
                         c.file_count.to_string(),
                         format!("{:.1}%", c.percentage),
                     ]
@@ -121,7 +134,7 @@ pub fn run_top(
                 .map(|item| {
                     vec![
                         item.path.clone(),
-                        item.size_human.clone(),
+                        display_size(item.disk_bytes, item.size_bytes),
                         item.item_type.clone(),
                         item.modified
                             .and_then(|m| {
@@ -160,7 +173,7 @@ pub fn run_search(
                 .map(|f| {
                     vec![
                         f.path.clone(),
-                        f.size_human.clone(),
+                        display_size(f.disk_bytes, f.size_bytes),
                         f.modified
                             .and_then(|m| {
                                 chrono::DateTime::from_timestamp(m, 0)
